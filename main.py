@@ -26,6 +26,7 @@ from .forward_records import (
     find_forward_candidates,
 )
 from .gold import GoldPriceService
+from .onebot_forward import OneBotForwardGateway
 
 
 class ToolSuitePlugin(Star):
@@ -139,39 +140,6 @@ class ToolSuitePlugin(Star):
             days = self.DEFAULT_FORWARD_DEDUP_DAYS
         return max(1, min(days, self.MAX_FORWARD_DEDUP_DAYS))
 
-    async def _fetch_forward_payload(
-        self,
-        event: AstrMessageEvent,
-        forward_id: str,
-    ) -> Any:
-        bot = getattr(event, "bot", None)
-        call_action = getattr(bot, "call_action", None)
-        if not callable(call_action):
-            raise RuntimeError("当前平台事件不支持 get_forward_msg")
-
-        routing_params: dict[str, Any] = {}
-        self_id = str(getattr(event.message_obj, "self_id", "") or "").strip()
-        if self_id:
-            routing_params["self_id"] = self_id
-
-        try:
-            return await call_action(
-                "get_forward_msg",
-                message_id=forward_id,
-                **routing_params,
-            )
-        except Exception as message_id_error:
-            try:
-                return await call_action(
-                    "get_forward_msg",
-                    id=forward_id,
-                    **routing_params,
-                )
-            except Exception as id_error:
-                raise RuntimeError(
-                    f"get_forward_msg failed: {message_id_error}; fallback: {id_error}"
-                ) from id_error
-
     def _forward_reply_result(self, event: AstrMessageEvent, text: str):
         message_id = str(getattr(event.message_obj, "message_id", "") or "").strip()
         if message_id:
@@ -234,158 +202,6 @@ class ToolSuitePlugin(Star):
                 result.append(node)
         return result
 
-    @staticmethod
-    def _build_onebot_forward_nodes(
-        nodes: list[FlattenedForwardNode],
-    ) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        for node in nodes:
-            data: dict[str, Any] = {
-                "user_id": node.sender_id or "0",
-                "nickname": node.sender_name or "未知成员",
-                "content": list(node.content),
-            }
-            if node.timestamp > 0:
-                data["time"] = node.timestamp
-            result.append({"type": "node", "data": data})
-        return result
-
-    @staticmethod
-    def _onebot_action_failed(result: Any) -> bool:
-        if not isinstance(result, dict):
-            return False
-        status = str(result.get("status") or "").strip().lower()
-        if status in {"failed", "failure", "error"}:
-            return True
-        retcode = result.get("retcode")
-        try:
-            return retcode is not None and int(retcode) != 0
-        except (TypeError, ValueError):
-            return False
-
-    @staticmethod
-    def _onebot_routing_params(event: AstrMessageEvent) -> dict[str, Any]:
-        self_id = getattr(event.message_obj, "self_id", None)
-        return {"self_id": self_id} if self_id else {}
-
-    @staticmethod
-    def _onebot_message_id(event: AstrMessageEvent) -> int | str | None:
-        message_obj = getattr(event, "message_obj", None)
-        raw_message = getattr(message_obj, "raw_message", None)
-        raw_id = raw_message.get("message_id") if isinstance(raw_message, dict) else None
-        message_id = raw_id
-        if message_id in (None, ""):
-            message_id = getattr(message_obj, "message_id", None)
-        if message_id in (None, ""):
-            return None
-        if isinstance(message_id, str):
-            normalized = message_id.strip()
-            if not normalized:
-                return None
-            if normalized.lstrip("-").isdigit():
-                return int(normalized)
-            return normalized
-        return message_id
-
-    async def _send_flattened_forward(
-        self,
-        event: AstrMessageEvent,
-        nodes: list[FlattenedForwardNode],
-    ) -> str | None:
-        if not nodes:
-            return None
-        bot = getattr(event, "bot", None)
-        call_action = getattr(bot, "call_action", None)
-        if not callable(call_action):
-            return "当前平台不支持发送平铺合并转发。"
-
-        group_id = self._get_group_key(event)
-        if group_id is not None:
-            action = "send_group_forward_msg"
-            target_params: dict[str, Any] = {"group_id": group_id}
-        else:
-            action = "send_private_forward_msg"
-            target_params = {"user_id": str(event.get_sender_id())}
-        routing_params = self._onebot_routing_params(event)
-
-        for start in range(0, len(nodes), self.FORWARD_SEND_BATCH_SIZE):
-            batch = nodes[start : start + self.FORWARD_SEND_BATCH_SIZE]
-            messages = self._build_onebot_forward_nodes(batch)
-            try:
-                result = await call_action(
-                    action,
-                    messages=messages,
-                    **target_params,
-                    **routing_params,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[tool_suite] flattened forward send failed: "
-                    f"action={action}, batch_start={start}, error={exc}"
-                )
-                return "聊天记录平铺发送失败，请查看机器人日志。"
-            if self._onebot_action_failed(result):
-                logger.warning(
-                    "[tool_suite] flattened forward action failed: "
-                    f"action={action}, batch_start={start}, result={result}"
-                )
-                return "聊天记录平铺发送失败，请查看机器人日志。"
-        return None
-
-    async def _recall_original_forward(
-        self,
-        event: AstrMessageEvent,
-    ) -> str | None:
-        message_id = self._onebot_message_id(event)
-        if message_id is None:
-            return "撤回重复聊天记录失败：当前消息没有可用的消息 ID。"
-        bot = getattr(event, "bot", None)
-        api = getattr(bot, "api", None)
-        api_call_action = getattr(api, "call_action", None)
-        direct_call_action = getattr(bot, "call_action", None)
-        callers: list[tuple[str, Any, dict[str, Any]]] = []
-        if callable(api_call_action):
-            # This is the public AstrBot aiocqhttp contract for protocol APIs.
-            callers.append(("bot.api.call_action", api_call_action, {}))
-        if callable(direct_call_action) and api is not bot:
-            callers.append(
-                (
-                    "bot.call_action",
-                    direct_call_action,
-                    self._onebot_routing_params(event),
-                )
-            )
-        if not callers:
-            return "撤回重复聊天记录失败：当前平台不支持撤回操作。"
-
-        failures: list[str] = []
-        for caller_name, call_action, extra_params in callers:
-            try:
-                result = await call_action(
-                    "delete_msg",
-                    message_id=message_id,
-                    **extra_params,
-                )
-            except Exception as exc:
-                failures.append(f"{caller_name}: {type(exc).__name__}: {exc}")
-                continue
-            if not self._onebot_action_failed(result):
-                return None
-            failures.append(f"{caller_name}: result={result}")
-
-        logger.warning(
-            "[tool_suite] exact duplicate recall failed: "
-            f"message_id={message_id}, attempts={failures}"
-        )
-        return self._recall_permission_message(event)
-
-    def _recall_permission_message(self, event: AstrMessageEvent) -> str:
-        if self._get_group_key(event) is not None:
-            return (
-                "撤回重复聊天记录失败。请确认机器人拥有群管理员权限；"
-                "QQ 不允许管理员撤回群主或其他管理员的消息。"
-            )
-        return "撤回重复聊天记录失败，当前私聊可能不支持撤回对方消息。"
 
 
     @staticmethod
@@ -792,9 +608,12 @@ class ToolSuitePlugin(Star):
         if callable(should_call_llm):
             should_call_llm(False)
 
-        expander = ForwardRecordExpander(
-            lambda forward_id: self._fetch_forward_payload(event, forward_id)
+        gateway = OneBotForwardGateway(
+            event,
+            group_id=self._get_group_key(event),
+            warn=logger.warning,
         )
+        expander = ForwardRecordExpander(gateway.fetch)
         expanded = await expander.expand(candidates)
         if not expanded.complete or not expanded.record_hash:
             logger.warning(
@@ -830,7 +649,7 @@ class ToolSuitePlugin(Star):
 
         if enhanced_enabled:
             if decision.status == ForwardStatus.EXACT:
-                recall_error = await self._recall_original_forward(event)
+                recall_error = await gateway.recall_original()
                 if recall_error:
                     logger.warning(
                         "[tool_suite] enhanced forward recall did not complete: "
@@ -848,7 +667,10 @@ class ToolSuitePlugin(Star):
                 expanded.nodes,
                 decision.duplicate_leaf_hashes,
             )
-            send_error = await self._send_flattened_forward(event, flattened_nodes)
+            send_error = await gateway.send_flattened(
+                flattened_nodes,
+                batch_size=self.FORWARD_SEND_BATCH_SIZE,
+            )
             if send_error:
                 logger.warning(
                     "[tool_suite] enhanced forward send did not complete: "
