@@ -4,7 +4,6 @@ import asyncio
 import json
 import re
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +14,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.star import Context, Star
 
+from .forward_dedup import (
+    ForwardStatus,
+    classify_and_store_forward,
+    prune_forward_records,
+)
 from .forward_records import (
     FlattenedForwardNode,
     ForwardRecordExpander,
@@ -23,25 +27,17 @@ from .forward_records import (
 from .gold import GoldPriceService
 
 
-@dataclass(frozen=True)
-class ForwardDedupDecision:
-    status: str
-    reply_text: str
-    duplicate_leaf_hashes: frozenset[str]
-
-
 class ToolSuitePlugin(Star):
     """Gold-price lookup and group nickname tools with per-chat switches."""
 
     DEFAULT_FORWARD_DEDUP_DAYS = 2
     MAX_FORWARD_DEDUP_DAYS = 365
-    MAX_STORED_FORWARD_RECORDS = 10000
-    FORWARD_FINGERPRINT_VERSION = 3
     FORWARD_SEND_BATCH_SIZE = 100
-    FORWARD_STATUS_LATEST = "latest"
-    FORWARD_STATUS_PARTIAL = "partial"
-    FORWARD_STATUS_EXACT = "exact"
-    EXACT_FORWARD_REPLY = "该条news已经发送过啦"
+    FORWARD_REPLY_TEXT = {
+        ForwardStatus.LATEST: "咪~让我看看，你又发出来什么好东西",
+        ForwardStatus.PARTIAL: "咦，好熟悉的感觉，里面有部分内容已经有人发过一次啦",
+        ForwardStatus.EXACT: "该条news已经发送过啦",
+    }
     EXACT_FORWARD_IMAGE = "news.jpg"
 
     def __init__(self, context: Context):
@@ -140,73 +136,6 @@ class ToolSuitePlugin(Star):
         except (TypeError, ValueError):
             days = self.DEFAULT_FORWARD_DEDUP_DAYS
         return max(1, min(days, self.MAX_FORWARD_DEDUP_DAYS))
-
-    def _prune_forward_records(
-        self,
-        scope: dict[str, Any],
-        now: int,
-    ) -> list[dict[str, Any]]:
-        try:
-            fingerprint_version = int(
-                scope.get("forward_fingerprint_version", 0) or 0
-            )
-        except (TypeError, ValueError):
-            fingerprint_version = 0
-        if fingerprint_version not in {2, self.FORWARD_FINGERPRINT_VERSION}:
-            # Fingerprints before v2 encoded node grouping and cannot be
-            # converted into the flattened sequence without the source message.
-            scope["forward_records"] = []
-            scope["forward_fingerprint_version"] = (
-                self.FORWARD_FINGERPRINT_VERSION
-            )
-            return []
-
-        cutoff = now - self._forward_dedup_days(scope) * 86400
-        raw_records = scope.get("forward_records")
-        if not isinstance(raw_records, list):
-            raw_records = []
-        records: list[dict[str, Any]] = []
-        for item in raw_records:
-            if not isinstance(item, dict):
-                continue
-            try:
-                seen_at = int(item.get("seen_at", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            record_hash = str(item.get("record_hash") or "").strip()
-            content_hashes = item.get("content_hashes")
-            leaf_hashes = item.get("leaf_hashes")
-            if fingerprint_version == 2 and leaf_hashes is None:
-                # v2 already used the same flattened record fingerprint, but it
-                # did not persist per-leaf hashes required by enhanced resend.
-                leaf_hashes = []
-            if (
-                seen_at < cutoff
-                or not record_hash
-                or not isinstance(content_hashes, list)
-                or not isinstance(leaf_hashes, list)
-            ):
-                continue
-            records.append(
-                {
-                    "record_hash": record_hash,
-                    "content_hashes": [
-                        str(value)
-                        for value in content_hashes
-                        if str(value).strip()
-                    ],
-                    "leaf_hashes": [
-                        str(value)
-                        for value in leaf_hashes
-                        if str(value).strip()
-                    ],
-                    "seen_at": seen_at,
-                }
-            )
-        records = records[-self.MAX_STORED_FORWARD_RECORDS :]
-        scope["forward_records"] = records
-        scope["forward_fingerprint_version"] = self.FORWARD_FINGERPRINT_VERSION
-        return records
 
     async def _fetch_forward_payload(
         self,
@@ -456,81 +385,6 @@ class ToolSuitePlugin(Star):
             )
         return "撤回重复聊天记录失败，当前私聊可能不支持撤回对方消息。"
 
-    def _classify_and_store_forward(
-        self,
-        scope: dict[str, Any],
-        *,
-        record_hash: str,
-        content_hashes: tuple[str, ...],
-        leaf_hashes: tuple[str, ...],
-        compatible_record_hashes: tuple[str, ...] = (),
-        compatible_content_hashes: tuple[str, ...] = (),
-        now: int,
-    ) -> ForwardDedupDecision:
-        records = self._prune_forward_records(scope, now)
-        current_content = set(content_hashes).union(compatible_content_hashes)
-        current_content_sequence = tuple(content_hashes)
-        current_leaf_hashes = set(leaf_hashes)
-        exact_hashes = {record_hash, *compatible_record_hashes}
-        exact_hashes.discard("")
-        exact_record: dict[str, Any] | None = None
-        previous_content: set[str] = set()
-        previous_leaf_hashes: set[str] = set()
-
-        for record in records:
-            stored_content_sequence = tuple(record.get("content_hashes") or [])
-            previous_content.update(stored_content_sequence)
-            previous_leaf_hashes.update(record.get("leaf_hashes") or [])
-            expanded_content_matches = bool(current_content_sequence) and (
-                stored_content_sequence == current_content_sequence
-            )
-            if (
-                exact_record is None
-                and (
-                    record.get("record_hash") in exact_hashes
-                    or expanded_content_matches
-                )
-            ):
-                exact_record = record
-
-        if exact_record is not None:
-            exact_record["record_hash"] = record_hash
-            exact_record["content_hashes"] = list(content_hashes)
-            exact_record["leaf_hashes"] = list(leaf_hashes)
-            exact_record["seen_at"] = now
-            status = self.FORWARD_STATUS_EXACT
-            reply_text = self.EXACT_FORWARD_REPLY
-        else:
-            has_duplicate_content = bool(
-                current_content.intersection(previous_content)
-            )
-            status = (
-                self.FORWARD_STATUS_PARTIAL
-                if has_duplicate_content
-                else self.FORWARD_STATUS_LATEST
-            )
-            reply_text = (
-                "咦，好熟悉的感觉，里面有部分内容已经有人发过一次啦"
-                if has_duplicate_content
-                else "咪~让我看看，你又发出来什么好东西"
-            )
-            records.append(
-                {
-                    "record_hash": record_hash,
-                    "content_hashes": list(content_hashes),
-                    "leaf_hashes": list(leaf_hashes),
-                    "seen_at": now,
-                }
-            )
-
-        scope["forward_records"] = records[-self.MAX_STORED_FORWARD_RECORDS :]
-        return ForwardDedupDecision(
-            status=status,
-            reply_text=reply_text,
-            duplicate_leaf_hashes=frozenset(
-                current_leaf_hashes.intersection(previous_leaf_hashes)
-            ),
-        )
 
     @staticmethod
     def _extract_message_text(event: AstrMessageEvent) -> str:
@@ -748,7 +602,11 @@ class ToolSuitePlugin(Star):
         data = self._load_data()
         scope = self._get_scope(data, self._get_scope_key(event))
         scope["forward_dedup_days"] = days
-        self._prune_forward_records(scope, int(time.time()))
+        prune_forward_records(
+            scope,
+            now=int(time.time()),
+            retention_days=self._forward_dedup_days(scope),
+        )
         self._save_data(data)
         yield event.plain_result(f"聊天记录查重范围已调整为最近 {days} 天。")
 
@@ -756,7 +614,11 @@ class ToolSuitePlugin(Star):
     async def forward_record_status(self, event: AstrMessageEvent):
         data = self._load_data()
         scope = self._get_scope(data, self._get_scope_key(event))
-        records = self._prune_forward_records(scope, int(time.time()))
+        records = prune_forward_records(
+            scope,
+            now=int(time.time()),
+            retention_days=self._forward_dedup_days(scope),
+        )
         enabled = "开启" if scope.get("forward_enabled", False) else "关闭"
         enhanced_enabled = (
             "开启" if scope.get("forward_enhanced_enabled", False) else "关闭"
@@ -949,7 +811,7 @@ class ToolSuitePlugin(Star):
             scope = self._get_scope(data, self._get_scope_key(event))
             if not scope.get("forward_enabled", False):
                 return
-            decision = self._classify_and_store_forward(
+            decision = classify_and_store_forward(
                 scope,
                 record_hash=expanded.record_hash,
                 content_hashes=expanded.content_hashes,
@@ -957,6 +819,7 @@ class ToolSuitePlugin(Star):
                 compatible_record_hashes=(expanded.legacy_record_hash,),
                 compatible_content_hashes=expanded.legacy_content_hashes,
                 now=int(time.time()),
+                retention_days=self._forward_dedup_days(scope),
             )
             enhanced_enabled = bool(
                 scope.get("forward_enhanced_enabled", False)
@@ -964,7 +827,7 @@ class ToolSuitePlugin(Star):
             self._save_data(data)
 
         if enhanced_enabled:
-            if decision.status == self.FORWARD_STATUS_EXACT:
+            if decision.status == ForwardStatus.EXACT:
                 recall_error = await self._recall_original_forward(event)
                 if recall_error:
                     logger.warning(
@@ -974,7 +837,7 @@ class ToolSuitePlugin(Star):
                 return
 
             if (
-                decision.status == self.FORWARD_STATUS_LATEST
+                decision.status == ForwardStatus.LATEST
                 and expanded.max_forward_depth <= 1
             ):
                 return
@@ -991,7 +854,7 @@ class ToolSuitePlugin(Star):
                 )
             return
 
-        if decision.status == self.FORWARD_STATUS_EXACT:
+        if decision.status == ForwardStatus.EXACT:
             reply_sent = False
             image_path = Path(__file__).with_name(self.EXACT_FORWARD_IMAGE)
             if image_path.is_file():
@@ -1009,7 +872,13 @@ class ToolSuitePlugin(Star):
                     f"[tool_suite] exact duplicate image missing: {image_path}"
                 )
             if not reply_sent:
-                yield self._forward_reply_result(event, decision.reply_text)
+                yield self._forward_reply_result(
+                    event,
+                    self.FORWARD_REPLY_TEXT[decision.status],
+                )
             return
 
-        yield self._forward_reply_result(event, decision.reply_text)
+        yield self._forward_reply_result(
+            event,
+            self.FORWARD_REPLY_TEXT[decision.status],
+        )
