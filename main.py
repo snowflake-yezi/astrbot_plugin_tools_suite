@@ -10,11 +10,11 @@ import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Image, Plain, Reply
+from astrbot.api.message_components import Image, Plain, Reply
 from astrbot.api.star import Context, Star
 
 from .core.config import LEGACY_STATE_PATH, PLUGIN_NAME
-from .core.event import at_user_ids, group_id, message_text, scope_key
+from .core.event import group_id, scope_key
 from .core.models import PluginData
 from .core.state import PluginStateStore
 from .forward_dedup import (
@@ -27,6 +27,7 @@ from .forward_dedup import (
 from .forward_records import ForwardRecordExpander, find_forward_candidates
 from .gold import GoldPriceService
 from .onebot_forward import OneBotForwardGateway
+from .features.nickname.handler import NicknameHandler
 
 
 class ToolSuitePlugin(Star):
@@ -52,19 +53,13 @@ class ToolSuitePlugin(Star):
             legacy_path=LEGACY_STATE_PATH,
             warn=logger.warning,
         )
+        self.nickname_handler = NicknameHandler(self.state, self._save_data)
         self._forward_lock = asyncio.Lock()
 
     def _save_data(self, data: PluginData) -> None:
         enforce_forward_history_budget(data)
         self.state.save(data)
 
-    @staticmethod
-    def _get_group_users(scope: dict[str, Any]) -> dict[str, list[str]]:
-        users = scope.setdefault("users", {})
-        if not isinstance(users, dict):
-            users = {}
-            scope["users"] = users
-        return users
 
     def _feature_enabled(self, event: AstrMessageEvent, feature: str) -> bool:
         data = self.state.load()
@@ -148,60 +143,6 @@ class ToolSuitePlugin(Star):
         chain.append(image)
         return event.chain_result(chain)
 
-
-    @staticmethod
-    def _get_user_nicknames(
-        users: dict[str, list[str]], user_id: str
-    ) -> list[str]:
-        nicknames = users.get(user_id)
-        if not isinstance(nicknames, list):
-            return []
-        return [str(item) for item in nicknames if str(item).strip()]
-
-    def _find_users_by_nickname(
-        self, users: dict[str, list[str]], nickname: str
-    ) -> list[str]:
-        return [
-            str(user_id)
-            for user_id in users
-            if nickname in self._get_user_nicknames(users, str(user_id))
-        ]
-
-    def _all_nicknames(self, users: dict[str, list[str]]) -> list[str]:
-        nicknames: set[str] = set()
-        for user_id in users:
-            nicknames.update(self._get_user_nicknames(users, str(user_id)))
-        return sorted(nicknames, key=len, reverse=True)
-
-    def _match_at_nickname(
-        self, text: str, users: dict[str, list[str]]
-    ) -> tuple[str, str, list[str]] | None:
-        if not text.startswith("at"):
-            return None
-        payload = text[2:].strip()
-        if not payload:
-            return None
-        for nickname in self._all_nicknames(users):
-            if payload.startswith(nickname):
-                message = payload[len(nickname) :].strip()
-                user_ids = self._find_users_by_nickname(users, nickname)
-                if user_ids:
-                    return nickname, message, user_ids
-        return None
-
-    @staticmethod
-    def _parse_nickname_command(text: str) -> tuple[bool, str]:
-        match = re.match(r"^/?昵称(?:\s+(.+))?$", text.strip())
-        if not match:
-            return False, ""
-        return True, (match.group(1) or "").strip()
-
-    @staticmethod
-    def _build_nickname_list(nicknames: list[str]) -> str:
-        if not nicknames:
-            return "该用户还没有绑定昵称。"
-        return "该用户的昵称: " + ", ".join(nicknames)
-
     async def _send_price(self, event: AstrMessageEvent):
         if not self._feature_enabled(event, "gold"):
             return
@@ -274,19 +215,11 @@ class ToolSuitePlugin(Star):
 
     @filter.regex(r"^昵称开\s*$")
     async def enable_nickname(self, event: AstrMessageEvent):
-        if group_id(event) is None:
-            yield event.plain_result("昵称工具只支持群聊。")
-            return
-        self._set_features(event, nickname=True)
-        yield event.plain_result("昵称工具已开启。")
+        yield self.nickname_handler.set_enabled(event, True)
 
     @filter.regex(r"^昵称关\s*$")
     async def disable_nickname(self, event: AstrMessageEvent):
-        if group_id(event) is None:
-            yield event.plain_result("昵称工具只支持群聊。")
-            return
-        self._set_features(event, nickname=False)
-        yield event.plain_result("昵称工具已关闭，已有昵称数据会保留。")
+        yield self.nickname_handler.set_enabled(event, False)
 
     @filter.regex(r"^聊天记录开\s*$")
     async def enable_forward_records(self, event: AstrMessageEvent):
@@ -442,65 +375,10 @@ class ToolSuitePlugin(Star):
             yield result
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    @filter.regex(r".*")
     async def handle_nickname_at(self, event: AstrMessageEvent):
-        group_key = group_id(event)
-        if group_key is None:
-            return
-
-        text = message_text(event)
-        data = self.state.load()
-        scope = self.state.scope(data, scope_key(event))
-        users = self._get_group_users(scope)
-        is_command, nickname = self._parse_nickname_command(text)
-        mentioned_user_ids = at_user_ids(event)
-
-        if not scope.get("nickname_enabled", False):
-            return
-
-        matched = self._match_at_nickname(text, users)
-        if matched is not None:
-            _, message, user_ids = matched
-            chain: list[Any] = [At(qq=user_id) for user_id in user_ids]
-            if message:
-                chain.append(Plain(" " + message))
-            else:
-                chain.append(Plain("\u200b", convert=False))
-            yield event.chain_result(chain)
-            return
-
-        if not is_command or len(mentioned_user_ids) != 1:
-            return
-
-        target_user_id = mentioned_user_ids[0]
-        nicknames = self._get_user_nicknames(users, target_user_id)
-        if not nickname:
-            yield event.plain_result(self._build_nickname_list(nicknames))
-            return
-
-        bound_user_ids = self._find_users_by_nickname(users, nickname)
-        if nickname in nicknames:
-            if len(bound_user_ids) > 1:
-                yield event.plain_result("该用户已经在昵称集合中。")
-            else:
-                yield event.plain_result("该用户已经绑定该昵称。")
-            return
-
-        nicknames.append(nickname)
-        users[target_user_id] = nicknames
-        self._save_data(data)
-
-        collection_size = len(bound_user_ids) + 1
-        if collection_size == 1:
-            yield event.plain_result(f"昵称“{nickname}”已绑定到该用户。")
-        elif collection_size == 2:
-            yield event.plain_result(
-                f"昵称“{nickname}”已升级为集合，当前共 {collection_size} 人。"
-            )
-        else:
-            yield event.plain_result(
-                f"该用户已加入昵称“{nickname}”集合，当前共 {collection_size} 人。"
-            )
+        result = self.nickname_handler.handle(event)
+        if result is not None:
+            yield result
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.regex(r".*")
