@@ -1,35 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
-import sys
 import time
-import types
 import unittest
-from pathlib import Path
 
+from package_loader import load_module
 
-class FakeLogger:
-    def info(self, *args, **kwargs) -> None:
-        pass
-
-    def warning(self, *args, **kwargs) -> None:
-        pass
-
-
-astrbot = types.ModuleType("astrbot")
-astrbot_api = types.ModuleType("astrbot.api")
-astrbot_api.logger = FakeLogger()
-astrbot.api = astrbot_api
-sys.modules.setdefault("astrbot", astrbot)
-sys.modules.setdefault("astrbot.api", astrbot_api)
-
-GOLD_PATH = Path(__file__).resolve().parents[1] / "gold.py"
-spec = importlib.util.spec_from_file_location("tool_suite_gold_under_test", GOLD_PATH)
-if spec is None or spec.loader is None:
-    raise RuntimeError("无法加载 gold.py")
-gold_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(gold_module)
-GoldPriceService = gold_module.GoldPriceService
+GoldMarketClient = load_module("features.gold.sources").GoldMarketClient
 
 
 SAMPLE = [
@@ -47,7 +23,7 @@ class KlineParserTests(unittest.TestCase):
             "2026-09-01,962.50,957.92,966.00,956.00",
             "2026-09-02,948.00,937.50,948.00,926.80",
         ]
-        result = GoldPriceService._parse_eastmoney_klines(rows, 2)
+        result = GoldMarketClient._parse_eastmoney_klines(rows, 2)
         self.assertIsNotNone(result)
         self.assertEqual([row["date"] for row in result], ["2026-09-02", "2026-09-03"])
         self.assertEqual(result[-1]["close"], 957.5)
@@ -57,7 +33,7 @@ class KlineParserTests(unittest.TestCase):
             ["2026-09-02", 948.0, 937.5, 926.8, 948.0],
             ["2026-09-03", 939.99, 957.5, 937.5, 961.0],
         ]
-        result = GoldPriceService._parse_sge_klines(rows, 15)
+        result = GoldMarketClient._parse_sge_klines(rows, 15)
         self.assertIsNotNone(result)
         self.assertEqual(result[-1], SAMPLE[-1])
 
@@ -66,12 +42,12 @@ class KlineParserTests(unittest.TestCase):
             "2026-09-01,962.50,957.92,950.00,956.00",
             "2026-09-02,nan,937.50,948.00,926.80",
         ]
-        self.assertIsNone(GoldPriceService._parse_eastmoney_klines(rows, 15))
+        self.assertIsNone(GoldMarketClient._parse_eastmoney_klines(rows, 15))
 
 
 class KlineFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_sge_is_used_when_eastmoney_fails(self) -> None:
-        class Service(GoldPriceService):
+        class Service(GoldMarketClient):
             def __init__(self):
                 super().__init__()
                 self.calls = []
@@ -85,12 +61,12 @@ class KlineFallbackTests(unittest.IsolatedAsyncioTestCase):
                 return SAMPLE[-days:]
 
         service = Service()
-        result = await service._fetch_kline(object(), days=3)
+        result = await service._fetch_trend(object(), days=3)
         self.assertEqual(service.calls, ["eastmoney", "sge"])
         self.assertEqual(result, SAMPLE)
 
     async def test_fresh_cache_skips_network(self) -> None:
-        class Service(GoldPriceService):
+        class Service(GoldMarketClient):
             async def _fetch_eastmoney_kline(self, session, days):
                 raise AssertionError("新鲜缓存不应请求网络")
 
@@ -100,10 +76,10 @@ class KlineFallbackTests(unittest.IsolatedAsyncioTestCase):
         service = Service()
         service._kline_cache = SAMPLE
         service._kline_cache_time = time.time()
-        self.assertEqual(await service._fetch_kline(object(), days=2), SAMPLE[-2:])
+        self.assertEqual(await service._fetch_trend(object(), days=2), SAMPLE[-2:])
 
     async def test_recent_stale_cache_is_used_after_both_sources_fail(self) -> None:
-        class Service(GoldPriceService):
+        class Service(GoldMarketClient):
             async def _fetch_eastmoney_kline(self, session, days):
                 return None
 
@@ -113,10 +89,10 @@ class KlineFallbackTests(unittest.IsolatedAsyncioTestCase):
         service = Service()
         service._kline_cache = SAMPLE
         service._kline_cache_time = time.time() - 3600
-        self.assertEqual(await service._fetch_kline(object(), days=3), SAMPLE)
+        self.assertEqual(await service._fetch_trend(object(), days=3), SAMPLE)
 
     async def test_expired_cache_is_not_used(self) -> None:
-        class Service(GoldPriceService):
+        class Service(GoldMarketClient):
             async def _fetch_eastmoney_kline(self, session, days):
                 return None
 
@@ -126,10 +102,10 @@ class KlineFallbackTests(unittest.IsolatedAsyncioTestCase):
         service = Service()
         service._kline_cache = SAMPLE
         service._kline_cache_time = time.time() - service.KLINE_STALE_CACHE_TTL - 1
-        self.assertIsNone(await service._fetch_kline(object(), days=3))
+        self.assertIsNone(await service._fetch_trend(object(), days=3))
 
     async def test_sge_realtime_mapping_uses_close_as_price(self) -> None:
-        class Service(GoldPriceService):
+        class Service(GoldMarketClient):
             async def _fetch_sge_rows(self, session):
                 return [
                     ["2026-09-02", 948.0, 937.5, 926.8, 948.0],
@@ -143,7 +119,7 @@ class KlineFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["low"], 937.5)
 
     async def test_sge_realtime_tolerates_invalid_previous_row(self) -> None:
-        class Service(GoldPriceService):
+        class Service(GoldMarketClient):
             async def _fetch_sge_rows(self, session):
                 return [
                     ["invalid"],

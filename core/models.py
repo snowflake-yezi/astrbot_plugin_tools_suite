@@ -3,6 +3,24 @@ from __future__ import annotations
 from typing import Any, TypedDict
 
 
+class GoldQuote(TypedDict):
+    price: float
+    high: float
+    low: float
+    open: float
+    prev_close: float
+    time: str
+    source: str
+
+
+class GoldCandle(TypedDict):
+    date: str
+    open: float
+    close: float
+    high: float
+    low: float
+
+
 class ScopeData(TypedDict, total=False):
     gold_enabled: bool
     nickname_enabled: bool

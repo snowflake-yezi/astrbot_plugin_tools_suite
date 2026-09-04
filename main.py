@@ -6,8 +6,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import aiohttp
-
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain, Reply
@@ -25,7 +23,7 @@ from .forward_dedup import (
     prune_forward_records,
 )
 from .forward_records import ForwardRecordExpander, find_forward_candidates
-from .gold import GoldPriceService
+from .features.gold.handler import GoldHandler
 from .onebot_forward import OneBotForwardGateway
 from .features.nickname.handler import NicknameHandler
 
@@ -46,13 +44,13 @@ class ToolSuitePlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.context = context
-        self.gold_service = GoldPriceService()
         plugin_name = str(getattr(self, "name", PLUGIN_NAME) or PLUGIN_NAME)
         self.state = PluginStateStore.for_plugin(
             plugin_name,
             legacy_path=LEGACY_STATE_PATH,
             warn=logger.warning,
         )
+        self.gold_handler = GoldHandler(self.state, self._save_data)
         self.nickname_handler = NicknameHandler(self.state, self._save_data)
         self._forward_lock = asyncio.Lock()
 
@@ -60,11 +58,6 @@ class ToolSuitePlugin(Star):
         enforce_forward_history_budget(data)
         self.state.save(data)
 
-
-    def _feature_enabled(self, event: AstrMessageEvent, feature: str) -> bool:
-        data = self.state.load()
-        scope = self.state.scope(data, scope_key(event))
-        return bool(scope.get(f"{feature}_enabled", False))
 
     def _set_features(
         self,
@@ -143,39 +136,6 @@ class ToolSuitePlugin(Star):
         chain.append(image)
         return event.chain_result(chain)
 
-    async def _send_price(self, event: AstrMessageEvent):
-        if not self._feature_enabled(event, "gold"):
-            return
-        data = await self.gold_service._get_price()
-        if not data:
-            yield event.plain_result(
-                "\n".join(
-                    [
-                        "金价查询失败。",
-                        "已尝试国际金价 API、上海黄金交易所和新浪财经。",
-                        "请稍后重试或查看 AstrBot 日志。",
-                    ]
-                )
-            )
-            return
-        yield event.plain_result(self.gold_service._format(data))
-
-    async def _send_kline(self, event: AstrMessageEvent):
-        if not self._feature_enabled(event, "gold"):
-            return
-        async with aiohttp.ClientSession() as session:
-            data = await self.gold_service._fetch_kline(
-                session,
-                days=self.gold_service.TREND_DAYS,
-            )
-        if not data:
-            yield event.plain_result(
-                "K 线数据获取失败：东方财富和上海黄金交易所暂时均不可用，请稍后重试。"
-            )
-            return
-        path = self.gold_service._draw_kline(data)
-        yield event.image_result(path)
-
     @filter.regex(r"^工具开\s*$")
     async def enable_tools(self, event: AstrMessageEvent):
         in_group = group_id(event) is not None
@@ -205,13 +165,11 @@ class ToolSuitePlugin(Star):
 
     @filter.regex(r"^金价开\s*$")
     async def enable_gold(self, event: AstrMessageEvent):
-        self._set_features(event, gold=True)
-        yield event.plain_result("金价工具已开启。")
+        yield self.gold_handler.set_enabled(event, True)
 
     @filter.regex(r"^金价关\s*$")
     async def disable_gold(self, event: AstrMessageEvent):
-        self._set_features(event, gold=False)
-        yield event.plain_result("金价工具已关闭。")
+        yield self.gold_handler.set_enabled(event, False)
 
     @filter.regex(r"^昵称开\s*$")
     async def enable_nickname(self, event: AstrMessageEvent):
@@ -351,27 +309,32 @@ class ToolSuitePlugin(Star):
 
     @filter.regex(r"^gold\s*$")
     async def gold(self, event: AstrMessageEvent):
-        async for result in self._send_price(event):
+        result = await self.gold_handler.price(event)
+        if result is not None:
             yield result
 
     @filter.regex(r"^金价\s*$")
     async def gold_cn(self, event: AstrMessageEvent):
-        async for result in self._send_price(event):
+        result = await self.gold_handler.price(event)
+        if result is not None:
             yield result
 
     @filter.regex(r"^goldk\s*$")
     async def gold_kline(self, event: AstrMessageEvent):
-        async for result in self._send_kline(event):
+        result = await self.gold_handler.trend(event)
+        if result is not None:
             yield result
 
     @filter.regex(r"^金价走势\s*$")
     async def gold_trend_cn(self, event: AstrMessageEvent):
-        async for result in self._send_kline(event):
+        result = await self.gold_handler.trend(event)
+        if result is not None:
             yield result
 
     @filter.regex(r"^金价K线\s*$")
     async def gold_kline_cn(self, event: AstrMessageEvent):
-        async for result in self._send_kline(event):
+        result = await self.gold_handler.trend(event)
+        if result is not None:
             yield result
 
     @filter.event_message_type(filter.EventMessageType.ALL)
