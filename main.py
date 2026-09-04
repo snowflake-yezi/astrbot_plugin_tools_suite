@@ -17,14 +17,11 @@ from astrbot.api.star import Context, Star
 from .forward_dedup import (
     ForwardStatus,
     classify_and_store_forward,
+    dedupe_flattened_nodes,
     enforce_forward_history_budget,
     prune_forward_records,
 )
-from .forward_records import (
-    FlattenedForwardNode,
-    ForwardRecordExpander,
-    find_forward_candidates,
-)
+from .forward_records import ForwardRecordExpander, find_forward_candidates
 from .gold import GoldPriceService
 from .onebot_forward import OneBotForwardGateway
 
@@ -186,23 +183,6 @@ class ToolSuitePlugin(Star):
             chain.append(Reply(id=message_id))
         chain.append(image)
         return event.chain_result(chain)
-
-    @staticmethod
-    def _dedupe_flattened_nodes(
-        nodes: tuple[FlattenedForwardNode, ...],
-        historical_hashes: frozenset[str],
-    ) -> list[FlattenedForwardNode]:
-        seen: set[str] = set()
-        result: list[FlattenedForwardNode] = []
-        for node in nodes:
-            if node.content_hash in historical_hashes or node.content_hash in seen:
-                continue
-            seen.add(node.content_hash)
-            if node.content:
-                result.append(node)
-        return result
-
-
 
     @staticmethod
     def _extract_message_text(event: AstrMessageEvent) -> str:
@@ -663,7 +643,7 @@ class ToolSuitePlugin(Star):
             ):
                 return
 
-            flattened_nodes = self._dedupe_flattened_nodes(
+            flattened_nodes = dedupe_flattened_nodes(
                 expanded.nodes,
                 decision.duplicate_leaf_hashes,
             )

@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .forward_records import FlattenedForwardNode
 
 
 FINGERPRINT_VERSION = 3
@@ -21,6 +24,21 @@ class ForwardStatus(str, Enum):
 class ForwardDedupDecision:
     status: ForwardStatus
     duplicate_leaf_hashes: frozenset[str]
+
+
+def dedupe_flattened_nodes(
+    nodes: tuple[FlattenedForwardNode, ...],
+    historical_hashes: frozenset[str],
+) -> list[FlattenedForwardNode]:
+    seen: set[str] = set()
+    result: list[FlattenedForwardNode] = []
+    for node in nodes:
+        if node.content_hash in historical_hashes or node.content_hash in seen:
+            continue
+        seen.add(node.content_hash)
+        if node.content:
+            result.append(node)
+    return result
 
 
 def _hashes(values: Any) -> list[str]:

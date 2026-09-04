@@ -1,9 +1,11 @@
 import unittest
 
+from forward_records import FlattenedForwardNode
 from forward_dedup import (
     FINGERPRINT_VERSION,
     ForwardStatus,
     classify_and_store_forward,
+    dedupe_flattened_nodes,
     enforce_forward_history_budget,
     prune_forward_records,
 )
@@ -153,6 +155,26 @@ class ForwardDedupTests(unittest.TestCase):
         self.assertEqual(data["scopes"]["group:2"]["forward_records"], [new])
         self.assertTrue(data["scopes"]["group:1"]["forward_enabled"])
         self.assertEqual(data["scopes"]["group:2"]["users"], {"1": ["昵称"]})
+
+    def test_flattened_node_deduplication_uses_history_and_current_order(self):
+        def node(content_hash, content=True):
+            return FlattenedForwardNode(
+                content_hash=content_hash,
+                component_hashes=(),
+                content=({"type": "text", "data": {"text": content_hash}},)
+                if content
+                else (),
+                sender_id="1",
+                sender_name="成员",
+                timestamp=0,
+            )
+
+        result = dedupe_flattened_nodes(
+            (node("historical"), node("new"), node("new"), node("empty", False)),
+            frozenset({"historical"}),
+        )
+
+        self.assertEqual([item.content_hash for item in result], ["new"])
 
 
 if __name__ == "__main__":

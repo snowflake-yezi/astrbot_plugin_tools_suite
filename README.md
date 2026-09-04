@@ -104,11 +104,11 @@ pip install -r requirements.txt
 
 增强平铺重发媒体时，插件会优先使用平台返回的有效 `url`，并将 NapCat 返回的 Linux 或 Windows 裸绝对路径转换为 `file://` URI，同时清理首尾空白并编码路径中的空格。该转换只作用于 OneBot 重发载荷，不改变查重指纹；如果 NapCat 本地缓存文件已经被删除，即使 URI 格式正确，平台仍可能拒绝发送。
 
-嵌套深度最多 16 层，单份记录最多展开 5000 条叶子消息；超过限制或平台无法拉取转发内容时不会写入查重库。
+嵌套深度最多 16 层，单份记录最多展开 5000 条叶子消息和 10000 个消息组件；超过限制或平台无法拉取转发内容时不会写入查重库。
 
 ## 数据
 
-开关、昵称和聊天记录查重指纹保存在 `data/tool_suite.json`。关闭工具不会删除数据；超过当前查重天数的聊天记录会在后续查重时清理。
+开关、昵称和聊天记录查重指纹保存在 `data/tool_suite.json`。关闭工具不会删除数据；超过当前查重天数的聊天记录会在后续查重时清理。全部会话共享约 16 MiB 的查重历史预算，超出后按记录时间从旧到新淘汰，只清理查重历史，不影响开关和昵称。
 
 ## 依赖
 
@@ -117,5 +117,11 @@ pip install -r requirements.txt
 - `matplotlib`
 - `numpy`
 - `pillow`
+
+## 开发验证
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 插件内置的走势图字体基于 Noto Sans SC，并按 SIL Open Font License 1.1 授权；许可证位于 `assets/NotoSansSC-OFL.txt`。
