@@ -1,6 +1,8 @@
 import unittest
 
-from forward_records import ForwardRecordExpander
+from package_loader import load_module
+
+ForwardRecordExpander = load_module("features.forward.parser").ForwardRecordExpander
 
 
 def text(value):

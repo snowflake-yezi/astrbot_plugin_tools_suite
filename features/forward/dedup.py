@@ -6,7 +6,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .forward_records import FlattenedForwardNode
+    from .parser import FlattenedForwardNode
 
 
 FINGERPRINT_VERSION = 3

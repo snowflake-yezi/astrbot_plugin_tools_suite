@@ -4,7 +4,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .forward_records import FlattenedForwardNode
+    from .parser import FlattenedForwardNode
 
 
 class OneBotForwardGateway:
@@ -150,10 +150,8 @@ class OneBotForwardGateway:
         api_call_action = getattr(api, "call_action", None)
         direct_call_action = getattr(bot, "call_action", None)
         callers: list[tuple[str, Any, dict[str, Any]]] = []
-        if callable(api_call_action):
-            # AstrBot aiocqhttp 优先通过公开 API 对象执行协议动作。
-            callers.append(("bot.api.call_action", api_call_action, {}))
-        if callable(direct_call_action) and api is not bot:
+        if callable(direct_call_action):
+            # aiocqhttp 事件公开 bot.call_action；旧适配器的 api 对象仅作回退。
             callers.append(
                 (
                     "bot.call_action",
@@ -161,6 +159,8 @@ class OneBotForwardGateway:
                     self._routing_params(),
                 )
             )
+        if callable(api_call_action) and api is not bot:
+            callers.append(("bot.api.call_action", api_call_action, {}))
         if not callers:
             return "撤回重复聊天记录失败：当前平台不支持撤回操作。"
 

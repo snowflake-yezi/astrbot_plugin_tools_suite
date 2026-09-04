@@ -1,8 +1,12 @@
 import unittest
 from types import SimpleNamespace
 
-from forward_records import FlattenedForwardNode
-from onebot_forward import OneBotForwardGateway
+from package_loader import load_module
+
+gateway = load_module("features.forward.gateway")
+parser = load_module("features.forward.parser")
+FlattenedForwardNode = parser.FlattenedForwardNode
+OneBotForwardGateway = gateway.OneBotForwardGateway
 
 
 class FakeBot:
@@ -115,17 +119,16 @@ class OneBotForwardGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error, "聊天记录平铺发送失败，请查看机器人日志。")
         self.assertEqual(len(warnings), 1)
 
-    async def test_recall_falls_back_to_direct_bot_action(self):
+    async def test_recall_falls_back_to_api_object(self):
         api_calls = []
         direct_calls = []
 
         async def api_action(name, **params):
             api_calls.append((name, params))
-            raise RuntimeError("api unavailable")
 
         async def direct_action(name, params):
             direct_calls.append((name, params))
-            return None
+            raise RuntimeError("direct action unavailable")
 
         api = SimpleNamespace(call_action=api_action)
         gateway = OneBotForwardGateway(

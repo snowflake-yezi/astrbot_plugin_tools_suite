@@ -1,14 +1,16 @@
 import unittest
 
-from forward_records import FlattenedForwardNode
-from forward_dedup import (
-    FINGERPRINT_VERSION,
-    ForwardStatus,
-    classify_and_store_forward,
-    dedupe_flattened_nodes,
-    enforce_forward_history_budget,
-    prune_forward_records,
-)
+from package_loader import load_module
+
+dedup = load_module("features.forward.dedup")
+parser = load_module("features.forward.parser")
+FINGERPRINT_VERSION = dedup.FINGERPRINT_VERSION
+ForwardStatus = dedup.ForwardStatus
+classify_and_store_forward = dedup.classify_and_store_forward
+dedupe_flattened_nodes = dedup.dedupe_flattened_nodes
+enforce_forward_history_budget = dedup.enforce_forward_history_budget
+prune_forward_records = dedup.prune_forward_records
+FlattenedForwardNode = parser.FlattenedForwardNode
 
 
 class ForwardDedupTests(unittest.TestCase):
