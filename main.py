@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import time
 from pathlib import Path
@@ -14,6 +13,10 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.star import Context, Star
 
+from .core.config import LEGACY_STATE_PATH, PLUGIN_NAME
+from .core.event import at_user_ids, group_id, message_text, scope_key
+from .core.models import PluginData
+from .core.state import PluginStateStore
 from .forward_dedup import (
     ForwardStatus,
     classify_and_store_forward,
@@ -43,56 +46,17 @@ class ToolSuitePlugin(Star):
         super().__init__(context)
         self.context = context
         self.gold_service = GoldPriceService()
-        self.data_path = Path(__file__).with_name("data") / "tool_suite.json"
+        plugin_name = str(getattr(self, "name", PLUGIN_NAME) or PLUGIN_NAME)
+        self.state = PluginStateStore.for_plugin(
+            plugin_name,
+            legacy_path=LEGACY_STATE_PATH,
+            warn=logger.warning,
+        )
         self._forward_lock = asyncio.Lock()
 
-    def _load_data(self) -> dict[str, Any]:
-        if not self.data_path.exists():
-            return {"scopes": {}}
-        try:
-            data = json.loads(self.data_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning(f"[tool_suite] load data failed: {exc}")
-            return {"scopes": {}}
-        if not isinstance(data, dict):
-            return {"scopes": {}}
-        if not isinstance(data.get("scopes"), dict):
-            data["scopes"] = {}
-        return data
-
-    def _save_data(self, data: dict[str, Any]) -> None:
+    def _save_data(self, data: PluginData) -> None:
         enforce_forward_history_budget(data)
-        self.data_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = self.data_path.with_suffix(".tmp")
-        temporary_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary_path.replace(self.data_path)
-
-    def _get_group_key(self, event: AstrMessageEvent) -> str | None:
-        group_id = event.get_group_id()
-        if group_id is None or str(group_id).strip() == "":
-            return None
-        return str(group_id)
-
-    def _get_scope_key(self, event: AstrMessageEvent) -> str:
-        group_key = self._get_group_key(event)
-        if group_key is not None:
-            return f"group:{group_key}"
-        return f"private:{event.get_sender_id()}"
-
-    def _get_scope(self, data: dict[str, Any], scope_key: str) -> dict[str, Any]:
-        scopes = data.setdefault("scopes", {})
-        scope = scopes.setdefault(scope_key, {})
-        scope.setdefault("gold_enabled", False)
-        scope.setdefault("nickname_enabled", False)
-        scope.setdefault("forward_enabled", False)
-        scope.setdefault("forward_enhanced_enabled", False)
-        scope.setdefault("forward_dedup_days", self.DEFAULT_FORWARD_DEDUP_DAYS)
-        scope.setdefault("forward_records", [])
-        scope.setdefault("users", {})
-        return scope
+        self.state.save(data)
 
     @staticmethod
     def _get_group_users(scope: dict[str, Any]) -> dict[str, list[str]]:
@@ -103,8 +67,8 @@ class ToolSuitePlugin(Star):
         return users
 
     def _feature_enabled(self, event: AstrMessageEvent, feature: str) -> bool:
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
+        data = self.state.load()
+        scope = self.state.scope(data, scope_key(event))
         return bool(scope.get(f"{feature}_enabled", False))
 
     def _set_features(
@@ -116,8 +80,8 @@ class ToolSuitePlugin(Star):
         forward: bool | None = None,
         forward_enhanced: bool | None = None,
     ) -> None:
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
+        data = self.state.load()
+        scope = self.state.scope(data, scope_key(event))
         if gold is not None:
             scope["gold_enabled"] = gold
         if nickname is not None:
@@ -184,37 +148,6 @@ class ToolSuitePlugin(Star):
         chain.append(image)
         return event.chain_result(chain)
 
-    @staticmethod
-    def _extract_message_text(event: AstrMessageEvent) -> str:
-        parts: list[str] = []
-        for component in event.get_messages():
-            if isinstance(component, At):
-                continue
-            text = getattr(component, "text", None)
-            if text is None:
-                text = getattr(component, "plain", None)
-            if text is None:
-                continue
-            value = str(text).strip()
-            if value:
-                parts.append(value)
-        if parts:
-            return " ".join(parts).strip()
-        return event.get_message_str().strip()
-
-    @staticmethod
-    def _extract_at_user_ids(event: AstrMessageEvent) -> list[str]:
-        user_ids: list[str] = []
-        seen: set[str] = set()
-        for component in event.get_messages():
-            if not isinstance(component, At):
-                continue
-            user_id = str(getattr(component, "qq", "") or "").strip()
-            if not user_id or user_id == "all" or user_id in seen:
-                continue
-            seen.add(user_id)
-            user_ids.append(user_id)
-        return user_ids
 
     @staticmethod
     def _get_user_nicknames(
@@ -304,7 +237,7 @@ class ToolSuitePlugin(Star):
 
     @filter.regex(r"^工具开\s*$")
     async def enable_tools(self, event: AstrMessageEvent):
-        in_group = self._get_group_key(event) is not None
+        in_group = group_id(event) is not None
         self._set_features(
             event,
             gold=True,
@@ -341,7 +274,7 @@ class ToolSuitePlugin(Star):
 
     @filter.regex(r"^昵称开\s*$")
     async def enable_nickname(self, event: AstrMessageEvent):
-        if self._get_group_key(event) is None:
+        if group_id(event) is None:
             yield event.plain_result("昵称工具只支持群聊。")
             return
         self._set_features(event, nickname=True)
@@ -349,7 +282,7 @@ class ToolSuitePlugin(Star):
 
     @filter.regex(r"^昵称关\s*$")
     async def disable_nickname(self, event: AstrMessageEvent):
-        if self._get_group_key(event) is None:
+        if group_id(event) is None:
             yield event.plain_result("昵称工具只支持群聊。")
             return
         self._set_features(event, nickname=False)
@@ -358,8 +291,8 @@ class ToolSuitePlugin(Star):
     @filter.regex(r"^聊天记录开\s*$")
     async def enable_forward_records(self, event: AstrMessageEvent):
         self._set_features(event, forward=True)
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
+        data = self.state.load()
+        scope = self.state.scope(data, scope_key(event))
         yield event.plain_result(
             f"聊天记录展开与查重已开启，当前查重范围为最近 "
             f"{self._forward_dedup_days(scope)} 天。"
@@ -397,8 +330,8 @@ class ToolSuitePlugin(Star):
             )
             return
 
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
+        data = self.state.load()
+        scope = self.state.scope(data, scope_key(event))
         scope["forward_dedup_days"] = days
         prune_forward_records(
             scope,
@@ -410,8 +343,8 @@ class ToolSuitePlugin(Star):
 
     @filter.regex(r"^聊天记录状态\s*$")
     async def forward_record_status(self, event: AstrMessageEvent):
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
+        data = self.state.load()
+        scope = self.state.scope(data, scope_key(event))
         records = prune_forward_records(
             scope,
             now=int(time.time()),
@@ -434,10 +367,10 @@ class ToolSuitePlugin(Star):
 
     @filter.regex(r"^工具状态\s*$")
     async def tool_status(self, event: AstrMessageEvent):
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
+        data = self.state.load()
+        scope = self.state.scope(data, scope_key(event))
         gold_status = "开启" if scope.get("gold_enabled", False) else "关闭"
-        if self._get_group_key(event) is None:
+        if group_id(event) is None:
             nickname_status = "不可用（仅群聊）"
         else:
             nickname_status = (
@@ -511,16 +444,16 @@ class ToolSuitePlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.regex(r".*")
     async def handle_nickname_at(self, event: AstrMessageEvent):
-        group_key = self._get_group_key(event)
+        group_key = group_id(event)
         if group_key is None:
             return
 
-        text = self._extract_message_text(event)
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
+        text = message_text(event)
+        data = self.state.load()
+        scope = self.state.scope(data, scope_key(event))
         users = self._get_group_users(scope)
         is_command, nickname = self._parse_nickname_command(text)
-        at_user_ids = self._extract_at_user_ids(event)
+        mentioned_user_ids = at_user_ids(event)
 
         if not scope.get("nickname_enabled", False):
             return
@@ -536,10 +469,10 @@ class ToolSuitePlugin(Star):
             yield event.chain_result(chain)
             return
 
-        if not is_command or len(at_user_ids) != 1:
+        if not is_command or len(mentioned_user_ids) != 1:
             return
 
-        target_user_id = at_user_ids[0]
+        target_user_id = mentioned_user_ids[0]
         nicknames = self._get_user_nicknames(users, target_user_id)
         if not nickname:
             yield event.plain_result(self._build_nickname_list(nicknames))
@@ -578,8 +511,8 @@ class ToolSuitePlugin(Star):
         if str(event.get_sender_id()) == str(event.get_self_id() or ""):
             return
 
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
+        data = self.state.load()
+        scope = self.state.scope(data, scope_key(event))
         if not scope.get("forward_enabled", False):
             return
         enhanced_enabled = bool(scope.get("forward_enhanced_enabled", False))
@@ -590,7 +523,7 @@ class ToolSuitePlugin(Star):
 
         gateway = OneBotForwardGateway(
             event,
-            group_id=self._get_group_key(event),
+            group_id=group_id(event),
             warn=logger.warning,
         )
         expander = ForwardRecordExpander(gateway.fetch)
@@ -608,8 +541,8 @@ class ToolSuitePlugin(Star):
             return
 
         async with self._forward_lock:
-            data = self._load_data()
-            scope = self._get_scope(data, self._get_scope_key(event))
+            data = self.state.load()
+            scope = self.state.scope(data, scope_key(event))
             if not scope.get("forward_enabled", False):
                 return
             decision = classify_and_store_forward(
