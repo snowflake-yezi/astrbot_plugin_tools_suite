@@ -77,7 +77,8 @@ def find_forward_candidates(event: Any) -> list[Any]:
 
 
 class ForwardRecordExpander:
-    MAX_DEPTH = 16
+    MAX_FORWARD_DEPTH = 16
+    MAX_STRUCTURE_DEPTH = 256
     MAX_LEAF_MESSAGES = 5000
     MAX_COMPONENTS = 10000
     _MEDIA_DIGEST_PATTERN = re.compile(
@@ -109,6 +110,15 @@ class ForwardRecordExpander:
         self._forward_cache: dict[str, Any] = {}
         self._complete = True
         self._errors: list[str] = []
+
+    def _enter_forward_layer(self) -> bool:
+        next_depth = self._current_forward_depth + 1
+        self._max_forward_depth = max(self._max_forward_depth, next_depth)
+        if next_depth > self.MAX_FORWARD_DEPTH:
+            self._mark_incomplete("max-forward-depth-exceeded")
+            return False
+        self._current_forward_depth = next_depth
+        return True
 
     async def expand(self, candidates: list[Any]) -> ExpandedForwardRecord:
         for candidate in candidates:
@@ -150,8 +160,8 @@ class ForwardRecordExpander:
         )
 
     async def _expand_item(self, item: Any, depth: int) -> None:
-        if depth > self.MAX_DEPTH:
-            self._mark_incomplete("max-depth-exceeded")
+        if depth > self.MAX_STRUCTURE_DEPTH:
+            self._mark_incomplete("max-structure-depth-exceeded")
             return
         if len(self._leaf_hashes) >= self.MAX_LEAF_MESSAGES:
             self._mark_incomplete("max-leaf-messages-exceeded")
@@ -160,7 +170,7 @@ class ForwardRecordExpander:
             return
         if isinstance(item, (list, tuple)):
             for child in item:
-                await self._expand_item(child, depth)
+                await self._expand_item(child, depth + 1)
             return
 
         kind = component_kind(item)
@@ -169,11 +179,8 @@ class ForwardRecordExpander:
             return
         if kind == "nodes":
             nodes = self._field(item, "nodes") or self._field(item, "messages")
-            self._current_forward_depth += 1
-            self._max_forward_depth = max(
-                self._max_forward_depth,
-                self._current_forward_depth,
-            )
+            if not self._enter_forward_layer():
+                return
             try:
                 await self._expand_item(nodes, depth + 1)
             finally:
@@ -234,11 +241,8 @@ class ForwardRecordExpander:
                 )
 
     async def _expand_forward(self, item: Any, depth: int) -> None:
-        self._current_forward_depth += 1
-        self._max_forward_depth = max(
-            self._max_forward_depth,
-            self._current_forward_depth,
-        )
+        if not self._enter_forward_layer():
+            return
         try:
             await self._expand_forward_payload(item, depth)
         finally:
