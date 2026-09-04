@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -14,7 +14,7 @@ MAX_STORED_RECORDS = 10000
 MAX_HISTORY_BYTES = 16 * 1024 * 1024
 
 
-class ForwardStatus(str, Enum):
+class ForwardStatus(StrEnum):
     LATEST = "latest"
     PARTIAL = "partial"
     EXACT = "exact"
@@ -67,13 +67,16 @@ def enforce_forward_history_budget(
         for record in records:
             if not isinstance(record, dict):
                 continue
-            size = len(
-                json.dumps(
-                    record,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ) + 1
+            size = (
+                len(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                + 1
+            )
             try:
                 seen_at = int(record.get("seen_at", 0) or 0)
             except (TypeError, ValueError):
@@ -109,9 +112,7 @@ def prune_forward_records(
     retention_days: int,
 ) -> list[dict[str, Any]]:
     try:
-        fingerprint_version = int(
-            scope.get("forward_fingerprint_version", 0) or 0
-        )
+        fingerprint_version = int(scope.get("forward_fingerprint_version", 0) or 0)
     except (TypeError, ValueError):
         fingerprint_version = 0
 
@@ -209,7 +210,9 @@ def classify_and_store_forward(
         )
         status = ForwardStatus.EXACT
     else:
-        has_duplicate_leaf = bool(current_leaf_hashes.intersection(previous_leaf_hashes))
+        has_duplicate_leaf = bool(
+            current_leaf_hashes.intersection(previous_leaf_hashes)
+        )
         has_v2_duplicate = bool(
             set(compatible_content_hashes).intersection(previous_v2_content_hashes)
         )

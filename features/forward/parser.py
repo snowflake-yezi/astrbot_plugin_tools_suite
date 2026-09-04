@@ -3,10 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
-
 
 ForwardFetcher = Callable[[str], Awaitable[Any]]
 
@@ -254,9 +254,7 @@ class ForwardRecordExpander:
             ("content", "messages", "message", "nodes"),
         )
         forward_id = str(
-            self._field(item, "id")
-            or self._field(item, "message_id")
-            or ""
+            self._field(item, "id") or self._field(item, "message_id") or ""
         ).strip()
 
         if inline_present and inline_payload:
@@ -300,9 +298,7 @@ class ForwardRecordExpander:
         contains_message_records = any(
             isinstance(item, dict)
             and not component_kind(item)
-            and any(
-                key in item for key in ("messages", "message", "nodes", "content")
-            )
+            and any(key in item for key in ("messages", "message", "nodes", "content"))
             for item in payload
         )
         if contains_message_records:
@@ -486,12 +482,7 @@ class ForwardRecordExpander:
             return f"{media_kind}:unidentified:{json.dumps(fallback, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
 
         if kind == "reply":
-            value = (
-                data.get("message_str")
-                or data.get("text")
-                or data.get("id")
-                or ""
-            )
+            value = data.get("message_str") or data.get("text") or data.get("id") or ""
             return f"reply:{self._normalize_text(value)}"
 
         sanitized = self._sanitize_value(data)
@@ -637,9 +628,7 @@ class ForwardRecordExpander:
             if isinstance(data, dict):
                 return data
             return {
-                str(key): value
-                for key, value in component.items()
-                if key != "type"
+                str(key): value for key, value in component.items() if key != "type"
             }
         try:
             return {
@@ -682,12 +671,10 @@ class ForwardRecordExpander:
             return None
 
         sender_id = str(
-            first_value(("uin", "user_id", "userId", "sender_id", "qq"))
-            or "0"
+            first_value(("uin", "user_id", "userId", "sender_id", "qq")) or "0"
         ).strip()
         sender_name = str(
-            first_value(("name", "nickname", "sender_name", "card"))
-            or "未知成员"
+            first_value(("name", "nickname", "sender_name", "card")) or "未知成员"
         ).strip()
         try:
             timestamp = int(first_value(("time", "timestamp")) or 0)

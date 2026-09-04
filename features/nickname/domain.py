@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
@@ -13,7 +13,7 @@ class NicknameMatch:
     user_ids: tuple[str, ...]
 
 
-class BindStatus(str, Enum):
+class BindStatus(StrEnum):
     ADDED = "added"
     ALREADY_BOUND = "already-bound"
     ALREADY_IN_COLLECTION = "already-in-collection"

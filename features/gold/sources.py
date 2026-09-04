@@ -8,7 +8,6 @@ import re
 import time
 
 import aiohttp
-
 from astrbot.api import logger
 
 from ...core.models import GoldCandle, GoldQuote
@@ -97,7 +96,7 @@ class GoldMarketClient:
             return None
         timestamp = (payload.get("ts") or 0) / 1000
         quote_time = (
-            dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).strftime(
+            dt.datetime.fromtimestamp(timestamp, tz=dt.UTC).strftime(
                 "%Y-%m-%d %H:%M:%S UTC"
             )
             if timestamp

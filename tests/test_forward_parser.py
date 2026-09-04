@@ -66,18 +66,18 @@ class ForwardRecordLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("max-components-exceeded", result.errors)
 
     async def test_forward_depth_accepts_sixteen_layers(self):
-        result = await ForwardRecordExpander(
-            nested_forward_fetch(16)
-        ).expand([{"type": "forward", "data": {"id": "1"}}])
+        result = await ForwardRecordExpander(nested_forward_fetch(16)).expand(
+            [{"type": "forward", "data": {"id": "1"}}]
+        )
 
         self.assertTrue(result.complete)
         self.assertEqual(result.max_forward_depth, 16)
         self.assertEqual(result.leaf_count, 1)
 
     async def test_forward_depth_rejects_seventeen_layers(self):
-        result = await ForwardRecordExpander(
-            nested_forward_fetch(17)
-        ).expand([{"type": "forward", "data": {"id": "1"}}])
+        result = await ForwardRecordExpander(nested_forward_fetch(17)).expand(
+            [{"type": "forward", "data": {"id": "1"}}]
+        )
 
         self.assertFalse(result.complete)
         self.assertEqual(result.max_forward_depth, 17)

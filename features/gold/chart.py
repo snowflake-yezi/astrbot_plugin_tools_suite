@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from astrbot.api import logger
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from matplotlib import font_manager
 
-from astrbot.api import logger
-
-from ...core.config import PACKAGE_ROOT
+from ...core.config import PACKAGE_ROOT, PLUGIN_NAME
 from ...core.models import GoldCandle
 
 _FONT_CANDIDATES = (
@@ -105,8 +104,7 @@ class GoldTrendChart:
         )
 
         price_axis.set_title(
-            f"Au99.99 {len(data)}日走势  "
-            f"{first:.2f} → {last:.2f} ({percentage:+.2f}%)",
+            f"Au99.99 {len(data)}日走势  {first:.2f} → {last:.2f} ({percentage:+.2f}%)",
             fontsize=12,
             **self._text_style,
         )
@@ -136,7 +134,8 @@ class GoldTrendChart:
         )
 
         figure.tight_layout()
-        path = Path(tempfile.gettempdir()) / "gold_trend.png"
+        path = Path(get_astrbot_data_path()) / "temp" / PLUGIN_NAME / "gold_trend.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(path)
         plt.close(figure)
         return str(path)

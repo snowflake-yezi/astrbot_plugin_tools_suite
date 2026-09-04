@@ -84,10 +84,13 @@ class OneBotForwardGatewayTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(error)
-        self.assertEqual([name for name, _ in calls], [
-            "send_group_forward_msg",
-            "send_group_forward_msg",
-        ])
+        self.assertEqual(
+            [name for name, _ in calls],
+            [
+                "send_group_forward_msg",
+                "send_group_forward_msg",
+            ],
+        )
         self.assertEqual([len(params["messages"]) for _, params in calls], [2, 1])
         self.assertTrue(all(params["group_id"] == "42" for _, params in calls))
         self.assertTrue(all(params["self_id"] == "9" for _, params in calls))
@@ -97,6 +100,18 @@ class OneBotForwardGatewayTests(unittest.IsolatedAsyncioTestCase):
                 for _, params in calls
                 for node in params["messages"]
             )
+        )
+        self.assertEqual(
+            calls[0][1]["messages"][0],
+            {
+                "type": "node",
+                "data": {
+                    "user_id": "1",
+                    "nickname": "成员",
+                    "content": [{"type": "text", "data": {"text": "a"}}],
+                    "time": 100,
+                },
+            },
         )
 
     async def test_send_reports_failed_action(self):

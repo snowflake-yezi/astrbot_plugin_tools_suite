@@ -74,7 +74,13 @@ class GoldPriceServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_trend_uses_standard_window_and_chart(self):
         candles = [
-            {"date": "2026-01-01", "open": 500.0, "close": 510.0, "high": 515.0, "low": 495.0}
+            {
+                "date": "2026-01-01",
+                "open": 500.0,
+                "close": 510.0,
+                "high": 515.0,
+                "low": 495.0,
+            }
         ]
         market = FakeMarket(trend=candles)
         chart = FakeChart()

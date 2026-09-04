@@ -2,7 +2,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
+import astrbot_test_env  # noqa: F401
 from package_loader import load_module
 
 try:
@@ -51,7 +53,7 @@ class FakeEvent:
 
 
 class RecordingGateway:
-    instances = []
+    instances: ClassVar[list["RecordingGateway"]] = []
 
     def __init__(self, event, **_):
         self.event = event
@@ -80,6 +82,7 @@ class MergedForwardHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temporary_directory.cleanup)
         path = Path(self.temporary_directory.name) / "state.json"
         self.state = state_module.PluginStateStore(path)
+        self.handler_type = handler_module.MergedForwardHandler
         self.handler = handler_module.MergedForwardHandler(
             self.state,
             clock=lambda: 1000,
@@ -109,10 +112,33 @@ class MergedForwardHandlerTests(unittest.IsolatedAsyncioTestCase):
         result = await self.handler.handle(event)
 
         self.assertEqual(result[0], "chain")
-        self.assertEqual([type(item).__name__ for item in result[1]], ["Reply", "Plain"])
+        self.assertEqual(
+            [type(item).__name__ for item in result[1]], ["Reply", "Plain"]
+        )
         self.assertFalse(event.llm_enabled)
         records = self.state.load()["scopes"]["group:42"]["forward_records"]
         self.assertEqual(len(records), 1)
+
+    async def test_basic_exact_duplicate_uses_packaged_image_component(self):
+        self.enable()
+        handler = self.handler_type(
+            self.state,
+            clock=lambda: 1000,
+            warn=lambda _: None,
+            gateway_factory=RecordingGateway,
+            image_path=Path(__file__).resolve().parents[1] / "news.jpg",
+        )
+        messages = self.inline_forward(
+            [{"type": "text", "data": {"text": "same image"}}]
+        )
+
+        await handler.handle(FakeEvent(messages))
+        result = await handler.handle(FakeEvent(messages))
+
+        self.assertEqual(result[0], "chain")
+        self.assertEqual(
+            [type(item).__name__ for item in result[1]], ["Reply", "Image"]
+        )
 
     async def test_enhanced_exact_duplicate_recalls_without_reply(self):
         self.enable(enhanced=True)

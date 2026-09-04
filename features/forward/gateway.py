@@ -57,7 +57,9 @@ class OneBotForwardGateway:
     def _message_id(self) -> int | str | None:
         message_obj = getattr(self._event, "message_obj", None)
         raw_message = getattr(message_obj, "raw_message", None)
-        raw_id = raw_message.get("message_id") if isinstance(raw_message, dict) else None
+        raw_id = (
+            raw_message.get("message_id") if isinstance(raw_message, dict) else None
+        )
         message_id = raw_id
         if message_id in (None, ""):
             message_id = getattr(message_obj, "message_id", None)

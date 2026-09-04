@@ -5,7 +5,7 @@ import re
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from astrbot.api import logger
 from astrbot.api.message_components import Image, Plain, Reply
@@ -29,7 +29,7 @@ class MergedForwardHandler:
     DEFAULT_DEDUP_DAYS = 2
     MAX_DEDUP_DAYS = 365
     SEND_BATCH_SIZE = 100
-    REPLY_TEXT = {
+    REPLY_TEXT: ClassVar[dict[ForwardStatus, str]] = {
         ForwardStatus.LATEST: "咪~让我看看，你又发出来什么好东西",
         ForwardStatus.PARTIAL: "咦，好熟悉的感觉，里面有部分内容已经有人发过一次啦",
         ForwardStatus.EXACT: "该条news已经发送过啦",
@@ -118,9 +118,7 @@ class MergedForwardHandler:
             retention_days=self.retention_days(scope),
         )
         enabled = "开启" if scope.get("forward_enabled", False) else "关闭"
-        enhanced = (
-            "开启" if scope.get("forward_enhanced_enabled", False) else "关闭"
-        )
+        enhanced = "开启" if scope.get("forward_enhanced_enabled", False) else "关闭"
         return event.plain_result(
             "\n".join(
                 [
@@ -198,13 +196,14 @@ class MergedForwardHandler:
                 return image_result
         return self._reply_result(event, self.REPLY_TEXT[decision.status])
 
-    async def _handle_enhanced(self, gateway: Any, expanded: Any, decision: Any) -> None:
+    async def _handle_enhanced(
+        self, gateway: Any, expanded: Any, decision: Any
+    ) -> None:
         if decision.status == ForwardStatus.EXACT:
             error = await gateway.recall_original()
             if error:
                 self._warn(
-                    "[tool_suite] enhanced forward recall did not complete: "
-                    f"{error}"
+                    f"[tool_suite] enhanced forward recall did not complete: {error}"
                 )
             return
         if decision.status == ForwardStatus.LATEST and expanded.max_forward_depth <= 1:
@@ -216,14 +215,13 @@ class MergedForwardHandler:
         )
         error = await gateway.send_flattened(nodes, batch_size=self.SEND_BATCH_SIZE)
         if error:
-            self._warn(
-                "[tool_suite] enhanced forward send did not complete: "
-                f"{error}"
-            )
+            self._warn(f"[tool_suite] enhanced forward send did not complete: {error}")
 
     def _image_reply_result(self, event: Any) -> Any | None:
         if not self._image_path.is_file():
-            self._warn(f"[tool_suite] exact duplicate image missing: {self._image_path}")
+            self._warn(
+                f"[tool_suite] exact duplicate image missing: {self._image_path}"
+            )
             return None
         try:
             image = Image.fromFileSystem(str(self._image_path))

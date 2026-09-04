@@ -8,7 +8,12 @@ from astrbot.api.message_components import At, Plain
 from ...core.event import at_user_ids, group_id, message_text, scope_key
 from ...core.models import PluginData
 from ...core.state import PluginStateStore
-from .domain import BindStatus, NicknameBook, format_nickname_list, parse_nickname_command
+from .domain import (
+    BindStatus,
+    NicknameBook,
+    format_nickname_list,
+    parse_nickname_command,
+)
 
 
 class NicknameHandler:

@@ -125,13 +125,10 @@ class ToolSuitePlugin(Star):
         data = self.state.load()
         scope = self.state.scope(data, scope_key(event))
         gold_status = "开启" if scope.get("gold_enabled", False) else "关闭"
-        nickname_status = (
-            "不可用（仅群聊）"
-            if group_id(event) is None
-            else "开启"
-            if scope.get("nickname_enabled", False)
-            else "关闭"
-        )
+        if group_id(event) is None:
+            nickname_status = "不可用（仅群聊）"
+        else:
+            nickname_status = "开启" if scope.get("nickname_enabled", False) else "关闭"
         forward_status = "开启" if scope.get("forward_enabled", False) else "关闭"
         enhanced_status = (
             "开启" if scope.get("forward_enhanced_enabled", False) else "关闭"
