@@ -79,6 +79,7 @@ def find_forward_candidates(event: Any) -> list[Any]:
 class ForwardRecordExpander:
     MAX_DEPTH = 16
     MAX_LEAF_MESSAGES = 5000
+    MAX_COMPONENTS = 10000
     _MEDIA_DIGEST_PATTERN = re.compile(
         r"(?i)(?<![0-9a-f])([0-9a-f]{64}|[0-9a-f]{40}|[0-9a-f]{32})(?![0-9a-f])"
     )
@@ -101,6 +102,7 @@ class ForwardRecordExpander:
         self._leaf_hashes: list[str] = []
         self._component_hashes: list[str] = []
         self._nodes: list[FlattenedForwardNode] = []
+        self._component_count = 0
         self._current_forward_depth = 0
         self._max_forward_depth = 0
         self._active_forward_ids: set[str] = set()
@@ -362,11 +364,16 @@ class ForwardRecordExpander:
                 await self._expand_item(component, depth + 1)
                 continue
             canonical = self._canonical_component(component)
-            if canonical:
-                regular_components.append(canonical)
-                resend_component = self._resend_component(component)
-                if resend_component:
-                    resend_components.append(resend_component)
+            if not canonical:
+                continue
+            if self._component_count >= self.MAX_COMPONENTS:
+                self._mark_incomplete("max-components-exceeded")
+                return
+            self._component_count += 1
+            regular_components.append(canonical)
+            resend_component = self._resend_component(component)
+            if resend_component:
+                resend_components.append(resend_component)
         await flush_regular_components()
 
     def _append_leaf_hash(self, content_hash: str) -> None:

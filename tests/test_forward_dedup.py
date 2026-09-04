@@ -4,6 +4,7 @@ from forward_dedup import (
     FINGERPRINT_VERSION,
     ForwardStatus,
     classify_and_store_forward,
+    enforce_forward_history_budget,
     prune_forward_records,
 )
 
@@ -121,6 +122,37 @@ class ForwardDedupTests(unittest.TestCase):
         self.assertEqual(scope["forward_records"], [])
         self.assertEqual(scope["forward_fingerprint_version"], FINGERPRINT_VERSION)
         self.assertTrue(scope["forward_enabled"])
+
+    def test_history_budget_evicts_oldest_records_across_scopes(self):
+        old = {
+            "record_hash": "old",
+            "content_hashes": ["a"],
+            "leaf_hashes": ["a"],
+            "seen_at": 1,
+        }
+        new = {
+            "record_hash": "new",
+            "content_hashes": ["b"],
+            "leaf_hashes": ["b"],
+            "seen_at": 2,
+        }
+        data = {
+            "scopes": {
+                "group:1": {"forward_records": [old], "forward_enabled": True},
+                "group:2": {"forward_records": [new], "users": {"1": ["昵称"]}},
+            }
+        }
+
+        removed = enforce_forward_history_budget(
+            data,
+            max_bytes=77,
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(data["scopes"]["group:1"]["forward_records"], [])
+        self.assertEqual(data["scopes"]["group:2"]["forward_records"], [new])
+        self.assertTrue(data["scopes"]["group:1"]["forward_enabled"])
+        self.assertEqual(data["scopes"]["group:2"]["users"], {"1": ["昵称"]})
 
 
 if __name__ == "__main__":

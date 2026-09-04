@@ -17,6 +17,7 @@ from astrbot.api.star import Context, Star
 from .forward_dedup import (
     ForwardStatus,
     classify_and_store_forward,
+    enforce_forward_history_budget,
     prune_forward_records,
 )
 from .forward_records import (
@@ -62,6 +63,7 @@ class ToolSuitePlugin(Star):
         return data
 
     def _save_data(self, data: dict[str, Any]) -> None:
+        enforce_forward_history_budget(data)
         self.data_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = self.data_path.with_suffix(".tmp")
         temporary_path.write_text(

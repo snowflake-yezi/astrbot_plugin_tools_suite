@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 
 FINGERPRINT_VERSION = 3
 MAX_STORED_RECORDS = 10000
+MAX_HISTORY_BYTES = 16 * 1024 * 1024
 
 
 class ForwardStatus(str, Enum):
@@ -25,6 +27,61 @@ def _hashes(values: Any) -> list[str]:
     if not isinstance(values, list):
         return []
     return [str(value) for value in values if str(value).strip()]
+
+
+def enforce_forward_history_budget(
+    data: dict[str, Any],
+    *,
+    max_bytes: int = MAX_HISTORY_BYTES,
+) -> int:
+    scopes = data.get("scopes")
+    if not isinstance(scopes, dict):
+        return 0
+
+    entries: list[tuple[int, dict[str, Any], int]] = []
+    total_size = 0
+    for scope in scopes.values():
+        if not isinstance(scope, dict):
+            continue
+        records = scope.get("forward_records")
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            size = len(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ) + 1
+            try:
+                seen_at = int(record.get("seen_at", 0) or 0)
+            except (TypeError, ValueError):
+                seen_at = 0
+            entries.append((seen_at, record, size))
+            total_size += size
+
+    removed_ids: set[int] = set()
+    for _, record, size in sorted(entries, key=lambda item: item[0]):
+        if total_size <= max_bytes:
+            break
+        removed_ids.add(id(record))
+        total_size -= size
+
+    if not removed_ids:
+        return 0
+    # 预算跨会话共享，避免多个小会话分别撑满单会话上限。
+    for scope in scopes.values():
+        if not isinstance(scope, dict):
+            continue
+        records = scope.get("forward_records")
+        if isinstance(records, list):
+            scope["forward_records"] = [
+                record for record in records if id(record) not in removed_ids
+            ]
+    return len(removed_ids)
 
 
 def prune_forward_records(
