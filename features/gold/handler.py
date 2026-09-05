@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 from ...core.event import scope_key
-from ...core.models import PluginData
 from ...core.state import PluginStateStore
 from .service import GoldPriceService
 
@@ -13,18 +11,16 @@ class GoldHandler:
     def __init__(
         self,
         state: PluginStateStore,
-        save: Callable[[PluginData], None],
         service: GoldPriceService | None = None,
     ) -> None:
         self._state = state
-        self._save = save
         self._service = service or GoldPriceService()
 
     def set_enabled(self, event: Any, enabled: bool) -> Any:
         data = self._state.load()
         scope = self._state.scope(data, scope_key(event))
         scope["gold_enabled"] = enabled
-        self._save(data)
+        self._state.save(data)
         text = "金价工具已开启。" if enabled else "金价工具已关闭。"
         return event.plain_result(text)
 

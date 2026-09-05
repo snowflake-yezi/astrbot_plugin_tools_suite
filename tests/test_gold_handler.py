@@ -51,7 +51,7 @@ class GoldHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temporary_directory.cleanup)
         state = state_type(Path(self.temporary_directory.name) / "state.json")
         self.service = FakeGoldService()
-        self.handler = handler_type(state, state.save, self.service)
+        self.handler = handler_type(state, self.service)
         self.event = FakeEvent()
 
     async def test_disabled_feature_does_not_query_provider(self):

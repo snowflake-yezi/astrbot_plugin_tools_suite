@@ -46,7 +46,7 @@ class NicknameHandlerTests(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
         state = state_type(Path(self.temporary_directory.name) / "state.json")
-        self.handler = handler_type(state, state.save)
+        self.handler = handler_type(state)
         self.handler.set_enabled(FakeEvent([]), True)
 
     def test_binding_and_at_command_use_official_components(self):

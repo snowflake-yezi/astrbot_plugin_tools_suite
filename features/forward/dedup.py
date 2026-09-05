@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -20,12 +19,6 @@ class ForwardStatus(StrEnum):
     LATEST = "latest"
     PARTIAL = "partial"
     EXACT = "exact"
-
-
-@dataclass(frozen=True)
-class ForwardDedupDecision:
-    status: ForwardStatus
-    duplicate_leaf_hashes: frozenset[str]
 
 
 def dedupe_flattened_nodes(
@@ -173,7 +166,7 @@ def classify_and_store_forward(
     compatible_content_hashes: tuple[str, ...] = (),
     now: int,
     retention_days: int,
-) -> ForwardDedupDecision:
+) -> ForwardStatus:
     records = prune_forward_records(
         scope,
         now=now,
@@ -232,9 +225,4 @@ def classify_and_store_forward(
         )
 
     scope["forward_records"] = records[-MAX_STORED_RECORDS:]
-    return ForwardDedupDecision(
-        status=status,
-        duplicate_leaf_hashes=frozenset(
-            current_leaf_hashes.intersection(previous_leaf_hashes)
-        ),
-    )
+    return status

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 from astrbot.api.message_components import At, Plain
 
 from ...core.event import at_user_ids, group_id, message_text, scope_key
-from ...core.models import PluginData
 from ...core.state import PluginStateStore
 from .domain import (
     BindStatus,
@@ -17,13 +15,8 @@ from .domain import (
 
 
 class NicknameHandler:
-    def __init__(
-        self,
-        state: PluginStateStore,
-        save: Callable[[PluginData], None],
-    ) -> None:
+    def __init__(self, state: PluginStateStore) -> None:
         self._state = state
-        self._save = save
 
     def set_enabled(self, event: Any, enabled: bool) -> Any:
         if group_id(event) is None:
@@ -32,7 +25,7 @@ class NicknameHandler:
         data = self._state.load()
         scope = self._state.scope(data, scope_key(event))
         scope["nickname_enabled"] = enabled
-        self._save(data)
+        self._state.save(data)
         text = "昵称工具已开启。" if enabled else "昵称工具已关闭，已有昵称数据会保留。"
         return event.plain_result(text)
 
@@ -73,7 +66,7 @@ class NicknameHandler:
         if result.status == BindStatus.ALREADY_BOUND:
             return event.plain_result("该用户已经绑定该昵称。")
 
-        self._save(data)
+        self._state.save(data)
         if result.collection_size == 1:
             text = f"昵称“{nickname}”已绑定到该用户。"
         elif result.collection_size == 2:

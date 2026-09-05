@@ -42,14 +42,12 @@ class MergedForwardHandler:
         clock: Callable[[], float] = time.time,
         warn: Callable[[str], None] = logger.warning,
         gateway_factory: Callable[..., Any] = OneBotForwardGateway,
-        expander_factory: Callable[..., Any] = ForwardRecordExpander,
         image_path: Path = PACKAGE_ROOT / "news.jpg",
     ) -> None:
         self._state = state
         self._clock = clock
         self._warn = warn
         self._gateway_factory = gateway_factory
-        self._expander_factory = expander_factory
         self._image_path = image_path
         self._lock = asyncio.Lock()
 
@@ -159,7 +157,7 @@ class MergedForwardHandler:
             group_id=group_id(event),
             warn=self._warn,
         )
-        expanded = await self._expander_factory(gateway.fetch).expand(candidates)
+        expanded = await ForwardRecordExpander(gateway.fetch).expand(candidates)
         if not expanded.complete or not expanded.record_hash:
             self._warn(
                 "[tool_suite] forward record expansion incomplete: "
@@ -174,7 +172,7 @@ class MergedForwardHandler:
             scope = self._state.scope(data, scope_key(event))
             if not scope.get("forward_enabled", False):
                 return None
-            decision = classify_and_store_forward(
+            status = classify_and_store_forward(
                 scope,
                 record_hash=expanded.record_hash,
                 content_hashes=expanded.content_hashes,
@@ -188,18 +186,18 @@ class MergedForwardHandler:
             self._save(data)
 
         if enhanced:
-            await self._handle_enhanced(gateway, expanded, decision)
+            await self._handle_enhanced(gateway, expanded, status)
             return None
-        if decision.status == ForwardStatus.EXACT:
+        if status == ForwardStatus.EXACT:
             image_result = self._image_reply_result(event)
             if image_result is not None:
                 return image_result
-        return self._reply_result(event, self.REPLY_TEXT[decision.status])
+        return self._reply_result(event, self.REPLY_TEXT[status])
 
     async def _handle_enhanced(
-        self, gateway: Any, expanded: Any, decision: Any
+        self, gateway: Any, expanded: Any, status: ForwardStatus
     ) -> None:
-        if decision.status == ForwardStatus.EXACT:
+        if status == ForwardStatus.EXACT:
             error = await gateway.recall_original()
             if error:
                 self._warn(

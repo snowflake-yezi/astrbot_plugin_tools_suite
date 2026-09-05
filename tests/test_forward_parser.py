@@ -59,6 +59,22 @@ class ForwardRecordLimitTests(unittest.IsolatedAsyncioTestCase):
 
         self.fetch = unexpected_fetch
 
+    async def test_leaf_limit_checks_pending_content_after_nested_node(self):
+        for extra_leaf in (False, True):
+            with self.subTest(extra_leaf=extra_leaf):
+                expander = ForwardRecordExpander(self.fetch)
+                expander.MAX_LEAF_MESSAGES = 2
+                content = [text("first"), node([text("second")])]
+                if extra_leaf:
+                    content.append(text("third"))
+                result = await expander.expand([node(content)])
+
+                self.assertEqual(result.complete, not extra_leaf)
+                self.assertEqual(result.leaf_count, 2)
+                self.assertEqual(len(result.nodes), 2)
+                if extra_leaf:
+                    self.assertIn("max-leaf-messages-exceeded", result.errors)
+
     async def test_component_limit_accepts_exact_limit(self):
         expander = ForwardRecordExpander(self.fetch)
         result = await expander.expand(

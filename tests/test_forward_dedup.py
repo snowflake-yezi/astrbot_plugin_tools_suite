@@ -54,25 +54,23 @@ class ForwardDedupTests(unittest.TestCase):
             now=1001,
         )
 
-        self.assertEqual(first.status, ForwardStatus.LATEST)
-        self.assertEqual(second.status, ForwardStatus.LATEST)
-        self.assertEqual(second.duplicate_leaf_hashes, frozenset())
+        self.assertEqual(first, ForwardStatus.LATEST)
+        self.assertEqual(second, ForwardStatus.LATEST)
 
-    def test_partial_duplicate_reports_the_matching_leaf(self):
+    def test_matching_leaf_makes_record_partial(self):
         self.classify(
             record_hash="record-a",
             content_hashes=("component-a",),
             leaf_hashes=("leaf-a",),
         )
-        decision = self.classify(
+        status = self.classify(
             record_hash="record-b",
             content_hashes=("component-b",),
             leaf_hashes=("leaf-a", "leaf-b"),
             now=1001,
         )
 
-        self.assertEqual(decision.status, ForwardStatus.PARTIAL)
-        self.assertEqual(decision.duplicate_leaf_hashes, frozenset({"leaf-a"}))
+        self.assertEqual(status, ForwardStatus.PARTIAL)
 
     def test_exact_duplicate_refreshes_existing_record(self):
         self.classify(
@@ -80,18 +78,18 @@ class ForwardDedupTests(unittest.TestCase):
             content_hashes=("component-a",),
             leaf_hashes=("leaf-a",),
         )
-        decision = self.classify(
+        status = self.classify(
             record_hash="record-a",
             content_hashes=("component-a",),
             leaf_hashes=("leaf-a",),
             now=2000,
         )
 
-        self.assertEqual(decision.status, ForwardStatus.EXACT)
+        self.assertEqual(status, ForwardStatus.EXACT)
         self.assertEqual(len(self.scope["forward_records"]), 1)
         self.assertEqual(self.scope["forward_records"][0]["seen_at"], 2000)
 
-    def test_v2_partial_compatibility_does_not_claim_deletable_leaves(self):
+    def test_v2_content_hashes_preserve_partial_compatibility(self):
         self.scope = {
             "forward_fingerprint_version": 2,
             "forward_records": [
@@ -103,15 +101,14 @@ class ForwardDedupTests(unittest.TestCase):
             ],
         }
 
-        decision = self.classify(
+        status = self.classify(
             record_hash="record-new",
             content_hashes=("component-new",),
             leaf_hashes=("leaf-new",),
             compatible_content_hashes=("legacy-content",),
         )
 
-        self.assertEqual(decision.status, ForwardStatus.PARTIAL)
-        self.assertEqual(decision.duplicate_leaf_hashes, frozenset())
+        self.assertEqual(status, ForwardStatus.PARTIAL)
 
     def test_unknown_fingerprint_version_clears_only_records(self):
         scope = {

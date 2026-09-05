@@ -23,8 +23,8 @@ class ToolSuitePlugin(Star):
             legacy_path=LEGACY_STATE_PATH,
             warn=logger.warning,
         )
-        self.gold_handler = GoldHandler(self.state, self.state.save)
-        self.nickname_handler = NicknameHandler(self.state, self.state.save)
+        self.gold_handler = GoldHandler(self.state)
+        self.nickname_handler = NicknameHandler(self.state)
         self.forward_handler = MergedForwardHandler(self.state, warn=logger.warning)
 
     async def initialize(self) -> None:

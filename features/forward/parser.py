@@ -331,7 +331,7 @@ class ForwardRecordExpander:
             content_hash = self._hash(canonical)
             node_metadata = metadata or _NodeMetadata()
             self._component_hashes.extend(component_hashes)
-            self._append_leaf_hash(content_hash)
+            self._leaf_hashes.append(content_hash)
             self._nodes.append(
                 FlattenedForwardNode(
                     content_hash=content_hash,
@@ -362,12 +362,6 @@ class ForwardRecordExpander:
             if canonical:
                 regular_components.append(canonical)
         await flush_regular_components()
-
-    def _append_leaf_hash(self, content_hash: str) -> None:
-        if len(self._leaf_hashes) >= self.MAX_LEAF_MESSAGES:
-            self._mark_incomplete("max-leaf-messages-exceeded")
-            return
-        self._leaf_hashes.append(content_hash)
 
     def _mark_incomplete(self, reason: str) -> None:
         self._complete = False
