@@ -1,0 +1,5 @@
+name: tool_suite
+description: 集成实时金价、群聊昵称批量 @、嵌套合并转发展开与查重，支持按会话启停，默认关闭。
+author: yz
+version: 1.2.7
+repo: https://github.com/snowflake-yezi/astrbot_plugin_tools_suite
