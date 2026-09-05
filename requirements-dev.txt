@@ -1,0 +1,4 @@
+-r requirements.txt
+AstrBot>=4.9.2,<5
+pytest>=8,<10
+ruff>=0.12,<1

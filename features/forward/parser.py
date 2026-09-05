@@ -1,20 +1,19 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
-from urllib.parse import quote, urlsplit, urlunsplit
-
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 ForwardFetcher = Callable[[str], Awaitable[Any]]
 
 
 @dataclass(frozen=True)
 class FlattenedForwardNode:
-    content_hash: str
-    component_hashes: tuple[str, ...]
     content: tuple[dict[str, Any], ...]
     sender_id: str
     sender_name: str
@@ -33,7 +32,7 @@ class ExpandedForwardRecord:
     record_hash: str
     content_hashes: tuple[str, ...]
     legacy_record_hash: str
-    legacy_content_hashes: tuple[str, ...]
+    leaf_hashes: tuple[str, ...]
     nodes: tuple[FlattenedForwardNode, ...]
     max_forward_depth: int
     leaf_count: int
@@ -77,23 +76,12 @@ def find_forward_candidates(event: Any) -> list[Any]:
 
 
 class ForwardRecordExpander:
-    MAX_DEPTH = 16
+    MAX_FORWARD_DEPTH = 16
+    MAX_STRUCTURE_DEPTH = 256
     MAX_LEAF_MESSAGES = 5000
+    MAX_COMPONENTS = 10000
     _MEDIA_DIGEST_PATTERN = re.compile(
         r"(?i)(?<![0-9a-f])([0-9a-f]{64}|[0-9a-f]{40}|[0-9a-f]{32})(?![0-9a-f])"
-    )
-    _URI_SCHEME_PATTERN = re.compile(r"(?i)^[a-z][a-z0-9+.-]*:")
-    _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^[a-zA-Z]:[\\/]")
-    _RESEND_MEDIA_KINDS = frozenset(
-        {"image", "mface", "record", "audio", "voice", "video", "file"}
-    )
-    _RESEND_MEDIA_SOURCE_KEYS = (
-        "url",
-        "URL",
-        "file",
-        "path",
-        "sourcePath",
-        "local_path",
     )
 
     def __init__(self, fetch_forward: ForwardFetcher):
@@ -101,12 +89,22 @@ class ForwardRecordExpander:
         self._leaf_hashes: list[str] = []
         self._component_hashes: list[str] = []
         self._nodes: list[FlattenedForwardNode] = []
+        self._component_count = 0
         self._current_forward_depth = 0
         self._max_forward_depth = 0
         self._active_forward_ids: set[str] = set()
         self._forward_cache: dict[str, Any] = {}
         self._complete = True
         self._errors: list[str] = []
+
+    def _enter_forward_layer(self) -> bool:
+        next_depth = self._current_forward_depth + 1
+        self._max_forward_depth = max(self._max_forward_depth, next_depth)
+        if next_depth > self.MAX_FORWARD_DEPTH:
+            self._mark_incomplete("max-forward-depth-exceeded")
+            return False
+        self._current_forward_depth = next_depth
+        return True
 
     async def expand(self, candidates: list[Any]) -> ExpandedForwardRecord:
         for candidate in candidates:
@@ -139,26 +137,26 @@ class ForwardRecordExpander:
             record_hash=record_hash,
             content_hashes=tuple(self._component_hashes),
             legacy_record_hash=legacy_record_hash,
-            legacy_content_hashes=tuple(self._leaf_hashes),
+            leaf_hashes=tuple(self._leaf_hashes),
             nodes=tuple(self._nodes),
             max_forward_depth=self._max_forward_depth,
-            leaf_count=len(self._leaf_hashes),
+            leaf_count=len(self._nodes),
             complete=self._complete,
             errors=tuple(self._errors),
         )
 
     async def _expand_item(self, item: Any, depth: int) -> None:
-        if depth > self.MAX_DEPTH:
-            self._mark_incomplete("max-depth-exceeded")
+        if depth > self.MAX_STRUCTURE_DEPTH:
+            self._mark_incomplete("max-structure-depth-exceeded")
             return
-        if len(self._leaf_hashes) >= self.MAX_LEAF_MESSAGES:
+        if len(self._nodes) >= self.MAX_LEAF_MESSAGES:
             self._mark_incomplete("max-leaf-messages-exceeded")
             return
         if item is None:
             return
         if isinstance(item, (list, tuple)):
             for child in item:
-                await self._expand_item(child, depth)
+                await self._expand_item(child, depth + 1)
             return
 
         kind = component_kind(item)
@@ -167,11 +165,8 @@ class ForwardRecordExpander:
             return
         if kind == "nodes":
             nodes = self._field(item, "nodes") or self._field(item, "messages")
-            self._current_forward_depth += 1
-            self._max_forward_depth = max(
-                self._max_forward_depth,
-                self._current_forward_depth,
-            )
+            if not self._enter_forward_layer():
+                return
             try:
                 await self._expand_item(nodes, depth + 1)
             finally:
@@ -180,9 +175,7 @@ class ForwardRecordExpander:
         if kind == "node":
             content = self._field(item, "content") or self._field(item, "message")
             await self._expand_content(
-                content,
-                depth + 1,
-                metadata=self._node_metadata(item),
+                content, depth + 1, metadata=self._node_metadata(item)
             )
             return
 
@@ -198,9 +191,7 @@ class ForwardRecordExpander:
                     value = data.get(key)
                     if isinstance(value, list):
                         await self._expand_content(
-                            value,
-                            depth + 1,
-                            metadata=self._node_metadata(item),
+                            value, depth + 1, metadata=self._node_metadata(item)
                         )
                         return
 
@@ -212,9 +203,7 @@ class ForwardRecordExpander:
             message = item.get("message")
             if isinstance(message, list):
                 await self._expand_content(
-                    message,
-                    depth + 1,
-                    metadata=self._node_metadata(item),
+                    message, depth + 1, metadata=self._node_metadata(item)
                 )
                 return
 
@@ -226,17 +215,12 @@ class ForwardRecordExpander:
             content = item.get("content")
             if isinstance(content, list):
                 await self._expand_content(
-                    content,
-                    depth + 1,
-                    metadata=self._node_metadata(item),
+                    content, depth + 1, metadata=self._node_metadata(item)
                 )
 
     async def _expand_forward(self, item: Any, depth: int) -> None:
-        self._current_forward_depth += 1
-        self._max_forward_depth = max(
-            self._max_forward_depth,
-            self._current_forward_depth,
-        )
+        if not self._enter_forward_layer():
+            return
         try:
             await self._expand_forward_payload(item, depth)
         finally:
@@ -248,9 +232,7 @@ class ForwardRecordExpander:
             ("content", "messages", "message", "nodes"),
         )
         forward_id = str(
-            self._field(item, "id")
-            or self._field(item, "message_id")
-            or ""
+            self._field(item, "id") or self._field(item, "message_id") or ""
         ).strip()
 
         if inline_present and inline_payload:
@@ -294,9 +276,7 @@ class ForwardRecordExpander:
         contains_message_records = any(
             isinstance(item, dict)
             and not component_kind(item)
-            and any(
-                key in item for key in ("messages", "message", "nodes", "content")
-            )
+            and any(key in item for key in ("messages", "message", "nodes", "content"))
             for item in payload
         )
         if contains_message_records:
@@ -323,30 +303,26 @@ class ForwardRecordExpander:
         regular_components: list[str] = []
         resend_components: list[dict[str, Any]] = []
 
-        async def flush_regular_components() -> None:
-            if not regular_components:
+        def flush_regular_components() -> None:
+            if not resend_components:
                 return
-            if len(self._leaf_hashes) >= self.MAX_LEAF_MESSAGES:
+            if len(self._nodes) >= self.MAX_LEAF_MESSAGES:
                 self._mark_incomplete("max-leaf-messages-exceeded")
                 regular_components.clear()
                 resend_components.clear()
                 return
-            canonical = json.dumps(
-                regular_components,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            component_hashes = tuple(
-                self._hash(component) for component in regular_components
-            )
-            content_hash = self._hash(canonical)
+            if regular_components:
+                canonical = json.dumps(
+                    regular_components, ensure_ascii=False, separators=(",", ":")
+                )
+                self._component_hashes.extend(
+                    self._hash(component) for component in regular_components
+                )
+                self._leaf_hashes.append(self._hash(canonical))
             node_metadata = metadata or _NodeMetadata()
-            self._component_hashes.extend(component_hashes)
-            self._append_leaf_hash(content_hash)
+            # 指纹可忽略空白，重发内容仍须保留空白和重复消息。
             self._nodes.append(
                 FlattenedForwardNode(
-                    content_hash=content_hash,
-                    component_hashes=component_hashes,
                     content=tuple(resend_components),
                     sender_id=node_metadata.sender_id,
                     sender_name=node_metadata.sender_name,
@@ -358,22 +334,22 @@ class ForwardRecordExpander:
 
         for component in content:
             if component_kind(component) in {"forward", "node", "nodes"}:
-                await flush_regular_components()
+                flush_regular_components()
                 await self._expand_item(component, depth + 1)
                 continue
+            if self._component_count >= self.MAX_COMPONENTS:
+                self._mark_incomplete("max-components-exceeded")
+                return
+            self._component_count += 1
+            resend_component = self._resend_component(component)
+            if resend_component is None:
+                self._mark_incomplete("component-serialization-failed")
+                return
+            resend_components.append(resend_component)
             canonical = self._canonical_component(component)
             if canonical:
                 regular_components.append(canonical)
-                resend_component = self._resend_component(component)
-                if resend_component:
-                    resend_components.append(resend_component)
-        await flush_regular_components()
-
-    def _append_leaf_hash(self, content_hash: str) -> None:
-        if len(self._leaf_hashes) >= self.MAX_LEAF_MESSAGES:
-            self._mark_incomplete("max-leaf-messages-exceeded")
-            return
-        self._leaf_hashes.append(content_hash)
+        flush_regular_components()
 
     def _mark_incomplete(self, reason: str) -> None:
         self._complete = False
@@ -475,91 +451,27 @@ class ForwardRecordExpander:
             return f"{media_kind}:unidentified:{json.dumps(fallback, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
 
         if kind == "reply":
-            value = (
-                data.get("message_str")
-                or data.get("text")
-                or data.get("id")
-                or ""
-            )
+            value = data.get("message_str") or data.get("text") or data.get("id") or ""
             return f"reply:{self._normalize_text(value)}"
 
         sanitized = self._sanitize_value(data)
         return f"{kind}:{json.dumps(sanitized, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
 
-    @classmethod
-    def _resend_component(cls, component: Any) -> dict[str, Any] | None:
+    @staticmethod
+    def _resend_component(component: Any) -> dict[str, Any] | None:
         if isinstance(component, str):
             return {"type": "text", "data": {"text": component}}
+        if isinstance(component, dict):
+            return copy.deepcopy(component)
 
-        kind = component_kind(component)
-        data = cls._component_data(component)
-        if kind in {"plain", "text"}:
-            text = data.get("text")
-            if text is None:
-                text = data.get("plain")
-            if text in (None, ""):
-                return None
-            return {"type": "text", "data": {"text": str(text)}}
-
-        resend_kind = {
-            "plain": "text",
-            "audio": "record",
-            "voice": "record",
-        }.get(kind, kind)
-        if not resend_kind:
+        serializer = getattr(component, "toDict", None)
+        if not callable(serializer):
             return None
-        sanitized = cls._sanitize_value(data)
-        if not isinstance(sanitized, dict):
-            sanitized = {"value": sanitized}
-        if kind in cls._RESEND_MEDIA_KINDS:
-            sanitized = cls._normalize_resend_media_data(sanitized)
-        return {"type": resend_kind, "data": sanitized}
-
-    @classmethod
-    def _normalize_resend_media_data(
-        cls,
-        data: dict[str, Any],
-    ) -> dict[str, Any]:
-        normalized = dict(data)
-        fallback_source = ""
-        preferred_source = ""
-
-        for key in cls._RESEND_MEDIA_SOURCE_KEYS:
-            value = normalized.get(key)
-            if not isinstance(value, str) or not value.strip():
-                continue
-            source = cls._normalize_resend_media_source(value)
-            normalized[key] = source
-            if not fallback_source:
-                fallback_source = source
-            if cls._URI_SCHEME_PATTERN.match(source):
-                preferred_source = source
-                break
-
-        source = preferred_source or fallback_source
-        if source:
-            # OneBot file-like segments consume `file`; NapCat may ignore `url`.
-            normalized["file"] = source
-        return normalized
-
-    @classmethod
-    def _normalize_resend_media_source(cls, value: str) -> str:
-        source = value.strip()
-        if cls._WINDOWS_ABSOLUTE_PATH_PATTERN.match(source):
-            path = source.replace("\\", "/")
-            return f"file:///{quote(path, safe='/:')}"
-        if source.startswith("\\\\"):
-            path = source.replace("\\", "/").lstrip("/")
-            return f"file://{quote(path, safe='/:')}"
-        if source.startswith("/"):
-            return f"file://{quote(source, safe='/:%')}"
-        if source.lower().startswith("file:"):
-            parts = urlsplit(source)
-            encoded_path = quote(parts.path, safe="/:%")
-            return urlunsplit(
-                (parts.scheme, parts.netloc, encoded_path, parts.query, parts.fragment)
-            )
-        return source
+        try:
+            serialized = serializer()
+        except Exception:
+            return None
+        return copy.deepcopy(serialized) if isinstance(serialized, dict) else None
 
     @staticmethod
     def _hash(value: str) -> str:
@@ -626,9 +538,7 @@ class ForwardRecordExpander:
             if isinstance(data, dict):
                 return data
             return {
-                str(key): value
-                for key, value in component.items()
-                if key != "type"
+                str(key): value for key, value in component.items() if key != "type"
             }
         try:
             return {
@@ -671,12 +581,10 @@ class ForwardRecordExpander:
             return None
 
         sender_id = str(
-            first_value(("uin", "user_id", "userId", "sender_id", "qq"))
-            or "0"
+            first_value(("uin", "user_id", "userId", "sender_id", "qq")) or "0"
         ).strip()
         sender_name = str(
-            first_value(("name", "nickname", "sender_name", "card"))
-            or "未知成员"
+            first_value(("name", "nickname", "sender_name", "card")) or "未知成员"
         ).strip()
         try:
             timestamp = int(first_value(("time", "timestamp")) or 0)

@@ -1,115 +1,34 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import re
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-
-import aiohttp
-
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.star import Context, Star
 
-from .forward_records import (
-    FlattenedForwardNode,
-    ForwardRecordExpander,
-    find_forward_candidates,
-)
-from .gold import GoldPriceService
-
-
-@dataclass(frozen=True)
-class ForwardDedupDecision:
-    status: str
-    reply_text: str
-    duplicate_leaf_hashes: frozenset[str]
+from .core.config import LEGACY_STATE_PATH, PLUGIN_NAME
+from .core.event import group_id, scope_key
+from .core.state import PluginStateStore
+from .features.forward.handler import MergedForwardHandler
+from .features.gold.handler import GoldHandler
+from .features.nickname.handler import NicknameHandler
 
 
 class ToolSuitePlugin(Star):
-    """Gold-price lookup and group nickname tools with per-chat switches."""
-
-    DEFAULT_FORWARD_DEDUP_DAYS = 2
-    MAX_FORWARD_DEDUP_DAYS = 365
-    MAX_STORED_FORWARD_RECORDS = 10000
-    FORWARD_FINGERPRINT_VERSION = 3
-    FORWARD_SEND_BATCH_SIZE = 100
-    FORWARD_STATUS_LATEST = "latest"
-    FORWARD_STATUS_PARTIAL = "partial"
-    FORWARD_STATUS_EXACT = "exact"
-    EXACT_FORWARD_REPLY = "该条news已经发送过啦"
-    EXACT_FORWARD_IMAGE = "news.jpg"
+    """按会话组合金价、群昵称和 QQ 合并转发能力。"""
 
     def __init__(self, context: Context):
         super().__init__(context)
-        self.context = context
-        self.gold_service = GoldPriceService()
-        self.data_path = Path(__file__).with_name("data") / "tool_suite.json"
-        self._forward_lock = asyncio.Lock()
-
-    def _load_data(self) -> dict[str, Any]:
-        if not self.data_path.exists():
-            return {"scopes": {}}
-        try:
-            data = json.loads(self.data_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning(f"[tool_suite] load data failed: {exc}")
-            return {"scopes": {}}
-        if not isinstance(data, dict):
-            return {"scopes": {}}
-        if not isinstance(data.get("scopes"), dict):
-            data["scopes"] = {}
-        return data
-
-    def _save_data(self, data: dict[str, Any]) -> None:
-        self.data_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = self.data_path.with_suffix(".tmp")
-        temporary_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        plugin_name = str(getattr(self, "name", PLUGIN_NAME) or PLUGIN_NAME)
+        self.state = PluginStateStore.for_plugin(
+            plugin_name,
+            legacy_path=LEGACY_STATE_PATH,
+            warn=logger.warning,
         )
-        temporary_path.replace(self.data_path)
+        self.gold_handler = GoldHandler(self.state)
+        self.nickname_handler = NicknameHandler(self.state)
+        self.forward_handler = MergedForwardHandler(self.state, warn=logger.warning)
 
-    def _get_group_key(self, event: AstrMessageEvent) -> str | None:
-        group_id = event.get_group_id()
-        if group_id is None or str(group_id).strip() == "":
-            return None
-        return str(group_id)
-
-    def _get_scope_key(self, event: AstrMessageEvent) -> str:
-        group_key = self._get_group_key(event)
-        if group_key is not None:
-            return f"group:{group_key}"
-        return f"private:{event.get_sender_id()}"
-
-    def _get_scope(self, data: dict[str, Any], scope_key: str) -> dict[str, Any]:
-        scopes = data.setdefault("scopes", {})
-        scope = scopes.setdefault(scope_key, {})
-        scope.setdefault("gold_enabled", False)
-        scope.setdefault("nickname_enabled", False)
-        scope.setdefault("forward_enabled", False)
-        scope.setdefault("forward_enhanced_enabled", False)
-        scope.setdefault("forward_dedup_days", self.DEFAULT_FORWARD_DEDUP_DAYS)
-        scope.setdefault("forward_records", [])
-        scope.setdefault("users", {})
-        return scope
-
-    @staticmethod
-    def _get_group_users(scope: dict[str, Any]) -> dict[str, list[str]]:
-        users = scope.setdefault("users", {})
-        if not isinstance(users, dict):
-            users = {}
-            scope["users"] = users
-        return users
-
-    def _feature_enabled(self, event: AstrMessageEvent, feature: str) -> bool:
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
-        return bool(scope.get(f"{feature}_enabled", False))
+    async def initialize(self) -> None:
+        self.forward_handler.enforce_history_budget()
 
     def _set_features(
         self,
@@ -120,8 +39,8 @@ class ToolSuitePlugin(Star):
         forward: bool | None = None,
         forward_enhanced: bool | None = None,
     ) -> None:
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
+        data = self.state.load()
+        scope = self.state.scope(data, scope_key(event))
         if gold is not None:
             scope["gold_enabled"] = gold
         if nickname is not None:
@@ -130,529 +49,11 @@ class ToolSuitePlugin(Star):
             scope["forward_enabled"] = forward
         if forward_enhanced is not None:
             scope["forward_enhanced_enabled"] = forward_enhanced
-        self._save_data(data)
-
-    def _forward_dedup_days(self, scope: dict[str, Any]) -> int:
-        try:
-            days = int(
-                scope.get("forward_dedup_days", self.DEFAULT_FORWARD_DEDUP_DAYS)
-            )
-        except (TypeError, ValueError):
-            days = self.DEFAULT_FORWARD_DEDUP_DAYS
-        return max(1, min(days, self.MAX_FORWARD_DEDUP_DAYS))
-
-    def _prune_forward_records(
-        self,
-        scope: dict[str, Any],
-        now: int,
-    ) -> list[dict[str, Any]]:
-        try:
-            fingerprint_version = int(
-                scope.get("forward_fingerprint_version", 0) or 0
-            )
-        except (TypeError, ValueError):
-            fingerprint_version = 0
-        if fingerprint_version not in {2, self.FORWARD_FINGERPRINT_VERSION}:
-            # Fingerprints before v2 encoded node grouping and cannot be
-            # converted into the flattened sequence without the source message.
-            scope["forward_records"] = []
-            scope["forward_fingerprint_version"] = (
-                self.FORWARD_FINGERPRINT_VERSION
-            )
-            return []
-
-        cutoff = now - self._forward_dedup_days(scope) * 86400
-        raw_records = scope.get("forward_records")
-        if not isinstance(raw_records, list):
-            raw_records = []
-        records: list[dict[str, Any]] = []
-        for item in raw_records:
-            if not isinstance(item, dict):
-                continue
-            try:
-                seen_at = int(item.get("seen_at", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            record_hash = str(item.get("record_hash") or "").strip()
-            content_hashes = item.get("content_hashes")
-            leaf_hashes = item.get("leaf_hashes")
-            if fingerprint_version == 2 and leaf_hashes is None:
-                # v2 already used the same flattened record fingerprint, but it
-                # did not persist per-leaf hashes required by enhanced resend.
-                leaf_hashes = []
-            if (
-                seen_at < cutoff
-                or not record_hash
-                or not isinstance(content_hashes, list)
-                or not isinstance(leaf_hashes, list)
-            ):
-                continue
-            records.append(
-                {
-                    "record_hash": record_hash,
-                    "content_hashes": [
-                        str(value)
-                        for value in content_hashes
-                        if str(value).strip()
-                    ],
-                    "leaf_hashes": [
-                        str(value)
-                        for value in leaf_hashes
-                        if str(value).strip()
-                    ],
-                    "seen_at": seen_at,
-                }
-            )
-        records = records[-self.MAX_STORED_FORWARD_RECORDS :]
-        scope["forward_records"] = records
-        scope["forward_fingerprint_version"] = self.FORWARD_FINGERPRINT_VERSION
-        return records
-
-    async def _fetch_forward_payload(
-        self,
-        event: AstrMessageEvent,
-        forward_id: str,
-    ) -> Any:
-        bot = getattr(event, "bot", None)
-        call_action = getattr(bot, "call_action", None)
-        if not callable(call_action):
-            raise RuntimeError("当前平台事件不支持 get_forward_msg")
-
-        routing_params: dict[str, Any] = {}
-        self_id = str(getattr(event.message_obj, "self_id", "") or "").strip()
-        if self_id:
-            routing_params["self_id"] = self_id
-
-        try:
-            return await call_action(
-                "get_forward_msg",
-                message_id=forward_id,
-                **routing_params,
-            )
-        except Exception as message_id_error:
-            try:
-                return await call_action(
-                    "get_forward_msg",
-                    id=forward_id,
-                    **routing_params,
-                )
-            except Exception as id_error:
-                raise RuntimeError(
-                    f"get_forward_msg failed: {message_id_error}; fallback: {id_error}"
-                ) from id_error
-
-    def _forward_reply_result(self, event: AstrMessageEvent, text: str):
-        message_id = str(getattr(event.message_obj, "message_id", "") or "").strip()
-        if message_id:
-            return event.chain_result([Reply(id=message_id), Plain(text)])
-        return event.plain_result(text)
-
-    @staticmethod
-    def _build_local_image_component(local_path: str) -> Any | None:
-        factory_names = (
-            "fromFileSystem",
-            "from_file_system",
-            "fromFile",
-            "from_file",
-            "fromPath",
-            "from_path",
-        )
-        for name in factory_names:
-            factory = getattr(Image, name, None)
-            if not callable(factory):
-                continue
-            try:
-                return factory(local_path)
-            except TypeError:
-                continue
-
-        for kwargs in ({"file": local_path}, {"path": local_path}, {"url": local_path}):
-            try:
-                return Image(**kwargs)
-            except TypeError:
-                continue
-        return None
-
-    def _forward_image_reply_result(
-        self,
-        event: AstrMessageEvent,
-        local_path: str,
-    ) -> Any | None:
-        image = self._build_local_image_component(local_path)
-        if image is None:
-            return None
-        chain: list[Any] = []
-        message_id = str(getattr(event.message_obj, "message_id", "") or "").strip()
-        if message_id:
-            chain.append(Reply(id=message_id))
-        chain.append(image)
-        return event.chain_result(chain)
-
-    @staticmethod
-    def _dedupe_flattened_nodes(
-        nodes: tuple[FlattenedForwardNode, ...],
-        historical_hashes: frozenset[str],
-    ) -> list[FlattenedForwardNode]:
-        seen: set[str] = set()
-        result: list[FlattenedForwardNode] = []
-        for node in nodes:
-            if node.content_hash in historical_hashes or node.content_hash in seen:
-                continue
-            seen.add(node.content_hash)
-            if node.content:
-                result.append(node)
-        return result
-
-    @staticmethod
-    def _build_onebot_forward_nodes(
-        nodes: list[FlattenedForwardNode],
-    ) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        for node in nodes:
-            data: dict[str, Any] = {
-                "user_id": node.sender_id or "0",
-                "nickname": node.sender_name or "未知成员",
-                "content": list(node.content),
-            }
-            if node.timestamp > 0:
-                data["time"] = node.timestamp
-            result.append({"type": "node", "data": data})
-        return result
-
-    @staticmethod
-    def _onebot_action_failed(result: Any) -> bool:
-        if not isinstance(result, dict):
-            return False
-        status = str(result.get("status") or "").strip().lower()
-        if status in {"failed", "failure", "error"}:
-            return True
-        retcode = result.get("retcode")
-        try:
-            return retcode is not None and int(retcode) != 0
-        except (TypeError, ValueError):
-            return False
-
-    @staticmethod
-    def _onebot_routing_params(event: AstrMessageEvent) -> dict[str, Any]:
-        self_id = getattr(event.message_obj, "self_id", None)
-        return {"self_id": self_id} if self_id else {}
-
-    @staticmethod
-    def _onebot_message_id(event: AstrMessageEvent) -> int | str | None:
-        message_obj = getattr(event, "message_obj", None)
-        raw_message = getattr(message_obj, "raw_message", None)
-        raw_id = raw_message.get("message_id") if isinstance(raw_message, dict) else None
-        message_id = raw_id
-        if message_id in (None, ""):
-            message_id = getattr(message_obj, "message_id", None)
-        if message_id in (None, ""):
-            return None
-        if isinstance(message_id, str):
-            normalized = message_id.strip()
-            if not normalized:
-                return None
-            if normalized.lstrip("-").isdigit():
-                return int(normalized)
-            return normalized
-        return message_id
-
-    async def _send_flattened_forward(
-        self,
-        event: AstrMessageEvent,
-        nodes: list[FlattenedForwardNode],
-    ) -> str | None:
-        if not nodes:
-            return None
-        bot = getattr(event, "bot", None)
-        call_action = getattr(bot, "call_action", None)
-        if not callable(call_action):
-            return "当前平台不支持发送平铺合并转发。"
-
-        group_id = self._get_group_key(event)
-        if group_id is not None:
-            action = "send_group_forward_msg"
-            target_params: dict[str, Any] = {"group_id": group_id}
-        else:
-            action = "send_private_forward_msg"
-            target_params = {"user_id": str(event.get_sender_id())}
-        routing_params = self._onebot_routing_params(event)
-
-        for start in range(0, len(nodes), self.FORWARD_SEND_BATCH_SIZE):
-            batch = nodes[start : start + self.FORWARD_SEND_BATCH_SIZE]
-            messages = self._build_onebot_forward_nodes(batch)
-            try:
-                result = await call_action(
-                    action,
-                    messages=messages,
-                    **target_params,
-                    **routing_params,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[tool_suite] flattened forward send failed: "
-                    f"action={action}, batch_start={start}, error={exc}"
-                )
-                return "聊天记录平铺发送失败，请查看机器人日志。"
-            if self._onebot_action_failed(result):
-                logger.warning(
-                    "[tool_suite] flattened forward action failed: "
-                    f"action={action}, batch_start={start}, result={result}"
-                )
-                return "聊天记录平铺发送失败，请查看机器人日志。"
-        return None
-
-    async def _recall_original_forward(
-        self,
-        event: AstrMessageEvent,
-    ) -> str | None:
-        message_id = self._onebot_message_id(event)
-        if message_id is None:
-            return "撤回重复聊天记录失败：当前消息没有可用的消息 ID。"
-        bot = getattr(event, "bot", None)
-        api = getattr(bot, "api", None)
-        api_call_action = getattr(api, "call_action", None)
-        direct_call_action = getattr(bot, "call_action", None)
-        callers: list[tuple[str, Any, dict[str, Any]]] = []
-        if callable(api_call_action):
-            # This is the public AstrBot aiocqhttp contract for protocol APIs.
-            callers.append(("bot.api.call_action", api_call_action, {}))
-        if callable(direct_call_action) and api is not bot:
-            callers.append(
-                (
-                    "bot.call_action",
-                    direct_call_action,
-                    self._onebot_routing_params(event),
-                )
-            )
-        if not callers:
-            return "撤回重复聊天记录失败：当前平台不支持撤回操作。"
-
-        failures: list[str] = []
-        for caller_name, call_action, extra_params in callers:
-            try:
-                result = await call_action(
-                    "delete_msg",
-                    message_id=message_id,
-                    **extra_params,
-                )
-            except Exception as exc:
-                failures.append(f"{caller_name}: {type(exc).__name__}: {exc}")
-                continue
-            if not self._onebot_action_failed(result):
-                return None
-            failures.append(f"{caller_name}: result={result}")
-
-        logger.warning(
-            "[tool_suite] exact duplicate recall failed: "
-            f"message_id={message_id}, attempts={failures}"
-        )
-        return self._recall_permission_message(event)
-
-    def _recall_permission_message(self, event: AstrMessageEvent) -> str:
-        if self._get_group_key(event) is not None:
-            return (
-                "撤回重复聊天记录失败。请确认机器人拥有群管理员权限；"
-                "QQ 不允许管理员撤回群主或其他管理员的消息。"
-            )
-        return "撤回重复聊天记录失败，当前私聊可能不支持撤回对方消息。"
-
-    def _classify_and_store_forward(
-        self,
-        scope: dict[str, Any],
-        *,
-        record_hash: str,
-        content_hashes: tuple[str, ...],
-        leaf_hashes: tuple[str, ...],
-        compatible_record_hashes: tuple[str, ...] = (),
-        compatible_content_hashes: tuple[str, ...] = (),
-        now: int,
-    ) -> ForwardDedupDecision:
-        records = self._prune_forward_records(scope, now)
-        current_content = set(content_hashes).union(compatible_content_hashes)
-        current_content_sequence = tuple(content_hashes)
-        current_leaf_hashes = set(leaf_hashes)
-        exact_hashes = {record_hash, *compatible_record_hashes}
-        exact_hashes.discard("")
-        exact_record: dict[str, Any] | None = None
-        previous_content: set[str] = set()
-        previous_leaf_hashes: set[str] = set()
-
-        for record in records:
-            stored_content_sequence = tuple(record.get("content_hashes") or [])
-            previous_content.update(stored_content_sequence)
-            previous_leaf_hashes.update(record.get("leaf_hashes") or [])
-            expanded_content_matches = bool(current_content_sequence) and (
-                stored_content_sequence == current_content_sequence
-            )
-            if (
-                exact_record is None
-                and (
-                    record.get("record_hash") in exact_hashes
-                    or expanded_content_matches
-                )
-            ):
-                exact_record = record
-
-        if exact_record is not None:
-            exact_record["record_hash"] = record_hash
-            exact_record["content_hashes"] = list(content_hashes)
-            exact_record["leaf_hashes"] = list(leaf_hashes)
-            exact_record["seen_at"] = now
-            status = self.FORWARD_STATUS_EXACT
-            reply_text = self.EXACT_FORWARD_REPLY
-        else:
-            has_duplicate_content = bool(
-                current_content.intersection(previous_content)
-            )
-            status = (
-                self.FORWARD_STATUS_PARTIAL
-                if has_duplicate_content
-                else self.FORWARD_STATUS_LATEST
-            )
-            reply_text = (
-                "咦，好熟悉的感觉，里面有部分内容已经有人发过一次啦"
-                if has_duplicate_content
-                else "咪~让我看看，你又发出来什么好东西"
-            )
-            records.append(
-                {
-                    "record_hash": record_hash,
-                    "content_hashes": list(content_hashes),
-                    "leaf_hashes": list(leaf_hashes),
-                    "seen_at": now,
-                }
-            )
-
-        scope["forward_records"] = records[-self.MAX_STORED_FORWARD_RECORDS :]
-        return ForwardDedupDecision(
-            status=status,
-            reply_text=reply_text,
-            duplicate_leaf_hashes=frozenset(
-                current_leaf_hashes.intersection(previous_leaf_hashes)
-            ),
-        )
-
-    @staticmethod
-    def _extract_message_text(event: AstrMessageEvent) -> str:
-        parts: list[str] = []
-        for component in event.get_messages():
-            if isinstance(component, At):
-                continue
-            text = getattr(component, "text", None)
-            if text is None:
-                text = getattr(component, "plain", None)
-            if text is None:
-                continue
-            value = str(text).strip()
-            if value:
-                parts.append(value)
-        if parts:
-            return " ".join(parts).strip()
-        return event.get_message_str().strip()
-
-    @staticmethod
-    def _extract_at_user_ids(event: AstrMessageEvent) -> list[str]:
-        user_ids: list[str] = []
-        seen: set[str] = set()
-        for component in event.get_messages():
-            if not isinstance(component, At):
-                continue
-            user_id = str(getattr(component, "qq", "") or "").strip()
-            if not user_id or user_id == "all" or user_id in seen:
-                continue
-            seen.add(user_id)
-            user_ids.append(user_id)
-        return user_ids
-
-    @staticmethod
-    def _get_user_nicknames(
-        users: dict[str, list[str]], user_id: str
-    ) -> list[str]:
-        nicknames = users.get(user_id)
-        if not isinstance(nicknames, list):
-            return []
-        return [str(item) for item in nicknames if str(item).strip()]
-
-    def _find_users_by_nickname(
-        self, users: dict[str, list[str]], nickname: str
-    ) -> list[str]:
-        return [
-            str(user_id)
-            for user_id in users
-            if nickname in self._get_user_nicknames(users, str(user_id))
-        ]
-
-    def _all_nicknames(self, users: dict[str, list[str]]) -> list[str]:
-        nicknames: set[str] = set()
-        for user_id in users:
-            nicknames.update(self._get_user_nicknames(users, str(user_id)))
-        return sorted(nicknames, key=len, reverse=True)
-
-    def _match_at_nickname(
-        self, text: str, users: dict[str, list[str]]
-    ) -> tuple[str, str, list[str]] | None:
-        if not text.startswith("at"):
-            return None
-        payload = text[2:].strip()
-        if not payload:
-            return None
-        for nickname in self._all_nicknames(users):
-            if payload.startswith(nickname):
-                message = payload[len(nickname) :].strip()
-                user_ids = self._find_users_by_nickname(users, nickname)
-                if user_ids:
-                    return nickname, message, user_ids
-        return None
-
-    @staticmethod
-    def _parse_nickname_command(text: str) -> tuple[bool, str]:
-        match = re.match(r"^/?昵称(?:\s+(.+))?$", text.strip())
-        if not match:
-            return False, ""
-        return True, (match.group(1) or "").strip()
-
-    @staticmethod
-    def _build_nickname_list(nicknames: list[str]) -> str:
-        if not nicknames:
-            return "该用户还没有绑定昵称。"
-        return "该用户的昵称: " + ", ".join(nicknames)
-
-    async def _send_price(self, event: AstrMessageEvent):
-        if not self._feature_enabled(event, "gold"):
-            return
-        data = await self.gold_service._get_price()
-        if not data:
-            yield event.plain_result(
-                "\n".join(
-                    [
-                        "金价查询失败。",
-                        "已尝试国际金价 API、上海黄金交易所和新浪财经。",
-                        "请稍后重试或查看 AstrBot 日志。",
-                    ]
-                )
-            )
-            return
-        yield event.plain_result(self.gold_service._format(data))
-
-    async def _send_kline(self, event: AstrMessageEvent):
-        if not self._feature_enabled(event, "gold"):
-            return
-        async with aiohttp.ClientSession() as session:
-            data = await self.gold_service._fetch_kline(
-                session,
-                days=self.gold_service.TREND_DAYS,
-            )
-        if not data:
-            yield event.plain_result(
-                "K 线数据获取失败：东方财富和上海黄金交易所暂时均不可用，请稍后重试。"
-            )
-            return
-        path = self.gold_service._draw_kline(data)
-        yield event.image_result(path)
+        self.state.save(data)
 
     @filter.regex(r"^工具开\s*$")
     async def enable_tools(self, event: AstrMessageEvent):
-        in_group = self._get_group_key(event) is not None
+        in_group = group_id(event) is not None
         self._set_features(
             event,
             gold=True,
@@ -679,112 +80,57 @@ class ToolSuitePlugin(Star):
 
     @filter.regex(r"^金价开\s*$")
     async def enable_gold(self, event: AstrMessageEvent):
-        self._set_features(event, gold=True)
-        yield event.plain_result("金价工具已开启。")
+        yield self.gold_handler.set_enabled(event, True)
 
     @filter.regex(r"^金价关\s*$")
     async def disable_gold(self, event: AstrMessageEvent):
-        self._set_features(event, gold=False)
-        yield event.plain_result("金价工具已关闭。")
+        yield self.gold_handler.set_enabled(event, False)
 
     @filter.regex(r"^昵称开\s*$")
     async def enable_nickname(self, event: AstrMessageEvent):
-        if self._get_group_key(event) is None:
-            yield event.plain_result("昵称工具只支持群聊。")
-            return
-        self._set_features(event, nickname=True)
-        yield event.plain_result("昵称工具已开启。")
+        yield self.nickname_handler.set_enabled(event, True)
 
     @filter.regex(r"^昵称关\s*$")
     async def disable_nickname(self, event: AstrMessageEvent):
-        if self._get_group_key(event) is None:
-            yield event.plain_result("昵称工具只支持群聊。")
-            return
-        self._set_features(event, nickname=False)
-        yield event.plain_result("昵称工具已关闭，已有昵称数据会保留。")
+        yield self.nickname_handler.set_enabled(event, False)
 
     @filter.regex(r"^聊天记录开\s*$")
     async def enable_forward_records(self, event: AstrMessageEvent):
-        self._set_features(event, forward=True)
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
-        yield event.plain_result(
-            f"聊天记录展开与查重已开启，当前查重范围为最近 "
-            f"{self._forward_dedup_days(scope)} 天。"
-        )
+        yield self.forward_handler.set_enabled(event, True)
 
     @filter.regex(r"^聊天记录关\s*$")
     async def disable_forward_records(self, event: AstrMessageEvent):
-        self._set_features(event, forward=False)
-        yield event.plain_result("聊天记录展开与查重已关闭，已有查重记录会保留。")
+        yield self.forward_handler.set_enabled(event, False)
 
     @filter.regex(r"^聊天记录增强开\s*$")
     async def enable_enhanced_forward_records(self, event: AstrMessageEvent):
-        self._set_features(event, forward=True, forward_enhanced=True)
-        yield event.plain_result(
-            "聊天记录增强已开启：基础查重已同步开启，将平铺重发新内容并撤回完全重复记录。"
-        )
+        yield self.forward_handler.set_enhanced(event, True)
 
     @filter.regex(r"^聊天记录增强关\s*$")
     async def disable_enhanced_forward_records(self, event: AstrMessageEvent):
-        self._set_features(event, forward_enhanced=False)
-        yield event.plain_result("聊天记录增强已关闭，基础展开与查重不受影响。")
+        yield self.forward_handler.set_enhanced(event, False)
 
     @filter.regex(r"^聊天记录查重天数\s*(\d+)\s*$")
     async def set_forward_dedup_days(self, event: AstrMessageEvent):
-        match = re.match(
-            r"^聊天记录查重天数\s*(\d+)\s*$",
-            event.get_message_str().strip(),
-        )
-        if not match:
-            return
-        days = int(match.group(1))
-        if days < 1 or days > self.MAX_FORWARD_DEDUP_DAYS:
-            yield event.plain_result(
-                f"聊天记录查重天数可设置为 1-{self.MAX_FORWARD_DEDUP_DAYS} 天。"
-            )
-            return
-
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
-        scope["forward_dedup_days"] = days
-        self._prune_forward_records(scope, int(time.time()))
-        self._save_data(data)
-        yield event.plain_result(f"聊天记录查重范围已调整为最近 {days} 天。")
+        result = self.forward_handler.set_retention_days(event)
+        if result is not None:
+            yield result
 
     @filter.regex(r"^聊天记录状态\s*$")
     async def forward_record_status(self, event: AstrMessageEvent):
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
-        records = self._prune_forward_records(scope, int(time.time()))
-        enabled = "开启" if scope.get("forward_enabled", False) else "关闭"
-        enhanced_enabled = (
-            "开启" if scope.get("forward_enhanced_enabled", False) else "关闭"
-        )
-        yield event.plain_result(
-            "\n".join(
-                [
-                    f"聊天记录展开与查重：{enabled}",
-                    f"聊天记录增强：{enhanced_enabled}",
-                    f"查重范围：最近 {self._forward_dedup_days(scope)} 天",
-                    f"范围内聊天记录：{len(records)} 份",
-                ]
-            )
-        )
+        yield self.forward_handler.status(event)
 
     @filter.regex(r"^工具状态\s*$")
     async def tool_status(self, event: AstrMessageEvent):
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
+        data = self.state.load()
+        scope = self.state.scope(data, scope_key(event))
         gold_status = "开启" if scope.get("gold_enabled", False) else "关闭"
-        if self._get_group_key(event) is None:
+        if group_id(event) is None:
             nickname_status = "不可用（仅群聊）"
         else:
-            nickname_status = (
-                "开启" if scope.get("nickname_enabled", False) else "关闭"
-            )
+            nickname_status = "开启" if scope.get("nickname_enabled", False) else "关闭"
         forward_status = "开启" if scope.get("forward_enabled", False) else "关闭"
-        forward_enhanced_status = (
+        enhanced_status = (
             "开启" if scope.get("forward_enhanced_enabled", False) else "关闭"
         )
         yield event.plain_result(
@@ -794,8 +140,8 @@ class ToolSuitePlugin(Star):
                     f"金价：{gold_status}",
                     f"昵称：{nickname_status}",
                     f"聊天记录展开与查重：{forward_status}",
-                    f"聊天记录增强：{forward_enhanced_status}",
-                    f"聊天记录查重范围：最近 {self._forward_dedup_days(scope)} 天",
+                    f"聊天记录增强（平铺重发）：{enhanced_status}",
+                    f"聊天记录查重范围：最近 {self.forward_handler.retention_days(scope)} 天",
                 ]
             )
         )
@@ -809,8 +155,8 @@ class ToolSuitePlugin(Star):
                     "工具开 / 工具关：开启或关闭当前会话的全部工具",
                     "金价开 / 金价关：单独控制金价工具",
                     "昵称开 / 昵称关：单独控制本群昵称工具",
-                    "聊天记录开 / 聊天记录关：控制合并转发展开与查重",
-                    "聊天记录增强开 / 聊天记录增强关：控制平铺重发、内容去重与完全重复撤回",
+                    "聊天记录开 / 聊天记录关：控制查重提醒与完全重复撤回",
+                    "聊天记录增强开 / 聊天记录增强关：控制嵌套记录原内容平铺重发",
                     "聊天记录查重天数 N：调整查重范围，默认 2 天",
                     "聊天记录状态：查看开关、天数和已记录数量",
                     "工具状态：查看当前开关状态",
@@ -825,191 +171,43 @@ class ToolSuitePlugin(Star):
 
     @filter.regex(r"^gold\s*$")
     async def gold(self, event: AstrMessageEvent):
-        async for result in self._send_price(event):
+        result = await self.gold_handler.price(event)
+        if result is not None:
             yield result
 
     @filter.regex(r"^金价\s*$")
     async def gold_cn(self, event: AstrMessageEvent):
-        async for result in self._send_price(event):
+        result = await self.gold_handler.price(event)
+        if result is not None:
             yield result
 
     @filter.regex(r"^goldk\s*$")
     async def gold_kline(self, event: AstrMessageEvent):
-        async for result in self._send_kline(event):
+        result = await self.gold_handler.trend(event)
+        if result is not None:
             yield result
 
     @filter.regex(r"^金价走势\s*$")
     async def gold_trend_cn(self, event: AstrMessageEvent):
-        async for result in self._send_kline(event):
+        result = await self.gold_handler.trend(event)
+        if result is not None:
             yield result
 
     @filter.regex(r"^金价K线\s*$")
     async def gold_kline_cn(self, event: AstrMessageEvent):
-        async for result in self._send_kline(event):
+        result = await self.gold_handler.trend(event)
+        if result is not None:
             yield result
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    @filter.regex(r".*")
     async def handle_nickname_at(self, event: AstrMessageEvent):
-        group_key = self._get_group_key(event)
-        if group_key is None:
-            return
+        result = self.nickname_handler.handle(event)
+        if result is not None:
+            yield result
 
-        text = self._extract_message_text(event)
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
-        users = self._get_group_users(scope)
-        is_command, nickname = self._parse_nickname_command(text)
-        at_user_ids = self._extract_at_user_ids(event)
-
-        if not scope.get("nickname_enabled", False):
-            return
-
-        matched = self._match_at_nickname(text, users)
-        if matched is not None:
-            _, message, user_ids = matched
-            chain: list[Any] = [At(qq=user_id) for user_id in user_ids]
-            if message:
-                chain.append(Plain(" " + message))
-            else:
-                chain.append(Plain("\u200b", convert=False))
-            yield event.chain_result(chain)
-            return
-
-        if not is_command or len(at_user_ids) != 1:
-            return
-
-        target_user_id = at_user_ids[0]
-        nicknames = self._get_user_nicknames(users, target_user_id)
-        if not nickname:
-            yield event.plain_result(self._build_nickname_list(nicknames))
-            return
-
-        bound_user_ids = self._find_users_by_nickname(users, nickname)
-        if nickname in nicknames:
-            if len(bound_user_ids) > 1:
-                yield event.plain_result("该用户已经在昵称集合中。")
-            else:
-                yield event.plain_result("该用户已经绑定该昵称。")
-            return
-
-        nicknames.append(nickname)
-        users[target_user_id] = nicknames
-        self._save_data(data)
-
-        collection_size = len(bound_user_ids) + 1
-        if collection_size == 1:
-            yield event.plain_result(f"昵称“{nickname}”已绑定到该用户。")
-        elif collection_size == 2:
-            yield event.plain_result(
-                f"昵称“{nickname}”已升级为集合，当前共 {collection_size} 人。"
-            )
-        else:
-            yield event.plain_result(
-                f"该用户已加入昵称“{nickname}”集合，当前共 {collection_size} 人。"
-            )
-
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL)
-    @filter.regex(r".*")
     async def handle_forward_records(self, event: AstrMessageEvent):
-        candidates = find_forward_candidates(event)
-        if not candidates:
-            return
-        if str(event.get_sender_id()) == str(event.get_self_id() or ""):
-            return
-
-        data = self._load_data()
-        scope = self._get_scope(data, self._get_scope_key(event))
-        if not scope.get("forward_enabled", False):
-            return
-        enhanced_enabled = bool(scope.get("forward_enhanced_enabled", False))
-
-        should_call_llm = getattr(event, "should_call_llm", None)
-        if callable(should_call_llm):
-            should_call_llm(False)
-
-        expander = ForwardRecordExpander(
-            lambda forward_id: self._fetch_forward_payload(event, forward_id)
-        )
-        expanded = await expander.expand(candidates)
-        if not expanded.complete or not expanded.record_hash:
-            logger.warning(
-                "[tool_suite] forward record expansion incomplete: "
-                f"leaf_count={expanded.leaf_count}, errors={expanded.errors}"
-            )
-            if not enhanced_enabled:
-                yield self._forward_reply_result(
-                    event,
-                    "聊天记录展开失败，未执行查重。",
-                )
-            return
-
-        async with self._forward_lock:
-            data = self._load_data()
-            scope = self._get_scope(data, self._get_scope_key(event))
-            if not scope.get("forward_enabled", False):
-                return
-            decision = self._classify_and_store_forward(
-                scope,
-                record_hash=expanded.record_hash,
-                content_hashes=expanded.content_hashes,
-                leaf_hashes=tuple(node.content_hash for node in expanded.nodes),
-                compatible_record_hashes=(expanded.legacy_record_hash,),
-                compatible_content_hashes=expanded.legacy_content_hashes,
-                now=int(time.time()),
-            )
-            enhanced_enabled = bool(
-                scope.get("forward_enhanced_enabled", False)
-            )
-            self._save_data(data)
-
-        if enhanced_enabled:
-            if decision.status == self.FORWARD_STATUS_EXACT:
-                recall_error = await self._recall_original_forward(event)
-                if recall_error:
-                    logger.warning(
-                        "[tool_suite] enhanced forward recall did not complete: "
-                        f"{recall_error}"
-                    )
-                return
-
-            if (
-                decision.status == self.FORWARD_STATUS_LATEST
-                and expanded.max_forward_depth <= 1
-            ):
-                return
-
-            flattened_nodes = self._dedupe_flattened_nodes(
-                expanded.nodes,
-                decision.duplicate_leaf_hashes,
-            )
-            send_error = await self._send_flattened_forward(event, flattened_nodes)
-            if send_error:
-                logger.warning(
-                    "[tool_suite] enhanced forward send did not complete: "
-                    f"{send_error}"
-                )
-            return
-
-        if decision.status == self.FORWARD_STATUS_EXACT:
-            reply_sent = False
-            image_path = Path(__file__).with_name(self.EXACT_FORWARD_IMAGE)
-            if image_path.is_file():
-                image_reply = self._forward_image_reply_result(event, str(image_path))
-                if image_reply is not None:
-                    yield image_reply
-                    reply_sent = True
-                else:
-                    logger.warning(
-                        "[tool_suite] unable to build exact duplicate image component: "
-                        f"{image_path}"
-                    )
-            else:
-                logger.warning(
-                    f"[tool_suite] exact duplicate image missing: {image_path}"
-                )
-            if not reply_sent:
-                yield self._forward_reply_result(event, decision.reply_text)
-            return
-
-        yield self._forward_reply_result(event, decision.reply_text)
+        result = await self.forward_handler.handle(event)
+        if result is not None:
+            yield result
