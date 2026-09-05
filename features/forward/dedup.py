@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+from ...core.models import ForwardRecord, PluginData, ScopeData
+
 if TYPE_CHECKING:
     from .parser import FlattenedForwardNode
 
@@ -47,7 +49,7 @@ def _hashes(values: Any) -> list[str]:
 
 
 def enforce_forward_history_budget(
-    data: dict[str, Any],
+    data: PluginData,
     *,
     max_bytes: int = MAX_HISTORY_BYTES,
 ) -> int:
@@ -55,7 +57,7 @@ def enforce_forward_history_budget(
     if not isinstance(scopes, dict):
         return 0
 
-    entries: list[tuple[int, dict[str, Any], int]] = []
+    entries: list[tuple[int, ForwardRecord, int]] = []
     total_size = 0
     for scope in scopes.values():
         if not isinstance(scope, dict):
@@ -105,11 +107,11 @@ def enforce_forward_history_budget(
 
 
 def prune_forward_records(
-    scope: dict[str, Any],
+    scope: ScopeData,
     *,
     now: int,
     retention_days: int,
-) -> list[dict[str, Any]]:
+) -> list[ForwardRecord]:
     try:
         fingerprint_version = int(scope.get("forward_fingerprint_version", 0) or 0)
     except (TypeError, ValueError):
@@ -125,7 +127,7 @@ def prune_forward_records(
     if not isinstance(raw_records, list):
         raw_records = []
 
-    records: list[dict[str, Any]] = []
+    records: list[ForwardRecord] = []
     for item in raw_records:
         if not isinstance(item, dict):
             continue
@@ -162,7 +164,7 @@ def prune_forward_records(
 
 
 def classify_and_store_forward(
-    scope: dict[str, Any],
+    scope: ScopeData,
     *,
     record_hash: str,
     content_hashes: tuple[str, ...],
@@ -181,7 +183,7 @@ def classify_and_store_forward(
     current_leaf_hashes = set(leaf_hashes)
     exact_hashes = {record_hash, *compatible_record_hashes}
     exact_hashes.discard("")
-    exact_record: dict[str, Any] | None = None
+    exact_record: ForwardRecord | None = None
     previous_leaf_hashes: set[str] = set()
     previous_v2_content_hashes: set[str] = set()
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import TypedDict
 
 
 class GoldQuote(TypedDict):
@@ -21,6 +21,13 @@ class GoldCandle(TypedDict):
     low: float
 
 
+class ForwardRecord(TypedDict):
+    record_hash: str
+    content_hashes: list[str]
+    leaf_hashes: list[str]
+    seen_at: int
+
+
 class ScopeData(TypedDict, total=False):
     gold_enabled: bool
     nickname_enabled: bool
@@ -28,7 +35,7 @@ class ScopeData(TypedDict, total=False):
     forward_enhanced_enabled: bool
     forward_dedup_days: int
     forward_fingerprint_version: int
-    forward_records: list[dict[str, Any]]
+    forward_records: list[ForwardRecord]
     users: dict[str, list[str]]
 
 
