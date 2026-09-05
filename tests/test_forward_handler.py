@@ -175,6 +175,57 @@ class MergedForwardHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sent[0][0]), 1)
         self.assertEqual(sent[0][1], self.handler.SEND_BATCH_SIZE)
 
+    async def test_enhanced_single_layer_partial_media_is_not_flattened(self):
+        self.enable(enhanced=True)
+        video_nodes = [
+            {
+                "type": "node",
+                "data": {
+                    "user_id": index,
+                    "nickname": f"成员{index}",
+                    "content": [
+                        {
+                            "type": "video",
+                            "data": {
+                                "file": file_name,
+                                "url": f"/app/.config/QQ/nt_data/Video/Ori/{file_name}",
+                            },
+                        }
+                    ],
+                },
+            }
+            for index, file_name in enumerate(("video-a.mp4", "video-b.mp4"), 1)
+        ]
+        image_node = {
+            "type": "node",
+            "data": {
+                "user_id": 3,
+                "nickname": "成员3",
+                "content": [
+                    {
+                        "type": "image",
+                        "data": {
+                            "file": "image.jpg",
+                            "url": "https://multimedia.nt.qq.com.cn/image.jpg",
+                        },
+                    }
+                ],
+            },
+        }
+
+        first = await self.handler.handle(FakeEvent(self.inline_forward(video_nodes)))
+        second = await self.handler.handle(
+            FakeEvent(self.inline_forward([*video_nodes, image_node]))
+        )
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(RecordingGateway.instances[0].sent, [])
+        self.assertEqual(RecordingGateway.instances[1].sent, [])
+        self.assertFalse(RecordingGateway.instances[1].recalled)
+        records = self.state.load()["scopes"]["group:42"]["forward_records"]
+        self.assertEqual(len(records), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

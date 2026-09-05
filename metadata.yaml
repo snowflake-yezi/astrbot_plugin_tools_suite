@@ -1,7 +1,7 @@
 name: tool_suite
 description: 集成实时金价、群聊昵称批量 @、嵌套合并转发展开与查重，支持按会话启停，默认关闭。
 author: yz
-version: 1.4.0
+version: 1.4.1
 repo: https://github.com/Criogaid/astrbot_plugin_tools_suite
 astrbot_version: ">=4.9.2,<5"
 support_platforms:

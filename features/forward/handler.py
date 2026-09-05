@@ -206,7 +206,7 @@ class MergedForwardHandler:
                     f"[tool_suite] enhanced forward recall did not complete: {error}"
                 )
             return
-        if decision.status == ForwardStatus.LATEST and expanded.max_forward_depth <= 1:
+        if expanded.max_forward_depth <= 1:
             return
 
         nodes = dedupe_flattened_nodes(
