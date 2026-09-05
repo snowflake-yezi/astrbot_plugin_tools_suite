@@ -28,12 +28,11 @@ class ForwardDedupDecision:
 
 def dedupe_flattened_nodes(
     nodes: tuple[FlattenedForwardNode, ...],
-    historical_hashes: frozenset[str],
 ) -> list[FlattenedForwardNode]:
     seen: set[str] = set()
     result: list[FlattenedForwardNode] = []
     for node in nodes:
-        if node.content_hash in historical_hashes or node.content_hash in seen:
+        if node.content_hash in seen:
             continue
         seen.add(node.content_hash)
         if node.content:

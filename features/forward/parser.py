@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 ForwardFetcher = Callable[[str], Awaitable[Any]]
 
@@ -14,7 +15,6 @@ ForwardFetcher = Callable[[str], Awaitable[Any]]
 @dataclass(frozen=True)
 class FlattenedForwardNode:
     content_hash: str
-    component_hashes: tuple[str, ...]
     content: tuple[dict[str, Any], ...]
     sender_id: str
     sender_name: str
@@ -83,19 +83,6 @@ class ForwardRecordExpander:
     MAX_COMPONENTS = 10000
     _MEDIA_DIGEST_PATTERN = re.compile(
         r"(?i)(?<![0-9a-f])([0-9a-f]{64}|[0-9a-f]{40}|[0-9a-f]{32})(?![0-9a-f])"
-    )
-    _URI_SCHEME_PATTERN = re.compile(r"(?i)^[a-z][a-z0-9+.-]*:")
-    _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^[a-zA-Z]:[\\/]")
-    _RESEND_MEDIA_KINDS = frozenset(
-        {"image", "mface", "record", "audio", "voice", "video", "file"}
-    )
-    _RESEND_MEDIA_SOURCE_KEYS = (
-        "url",
-        "URL",
-        "file",
-        "path",
-        "sourcePath",
-        "local_path",
     )
 
     def __init__(self, fetch_forward: ForwardFetcher):
@@ -348,7 +335,6 @@ class ForwardRecordExpander:
             self._nodes.append(
                 FlattenedForwardNode(
                     content_hash=content_hash,
-                    component_hashes=component_hashes,
                     content=tuple(resend_components),
                     sender_id=node_metadata.sender_id,
                     sender_name=node_metadata.sender_name,
@@ -363,17 +349,18 @@ class ForwardRecordExpander:
                 await flush_regular_components()
                 await self._expand_item(component, depth + 1)
                 continue
-            canonical = self._canonical_component(component)
-            if not canonical:
-                continue
             if self._component_count >= self.MAX_COMPONENTS:
                 self._mark_incomplete("max-components-exceeded")
                 return
             self._component_count += 1
-            regular_components.append(canonical)
             resend_component = self._resend_component(component)
-            if resend_component:
-                resend_components.append(resend_component)
+            if resend_component is None:
+                self._mark_incomplete("component-serialization-failed")
+                return
+            resend_components.append(resend_component)
+            canonical = self._canonical_component(component)
+            if canonical:
+                regular_components.append(canonical)
         await flush_regular_components()
 
     def _append_leaf_hash(self, content_hash: str) -> None:
@@ -488,80 +475,21 @@ class ForwardRecordExpander:
         sanitized = self._sanitize_value(data)
         return f"{kind}:{json.dumps(sanitized, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
 
-    @classmethod
-    def _resend_component(cls, component: Any) -> dict[str, Any] | None:
+    @staticmethod
+    def _resend_component(component: Any) -> dict[str, Any] | None:
         if isinstance(component, str):
             return {"type": "text", "data": {"text": component}}
+        if isinstance(component, dict):
+            return copy.deepcopy(component)
 
-        kind = component_kind(component)
-        data = cls._component_data(component)
-        if kind in {"plain", "text"}:
-            text = data.get("text")
-            if text is None:
-                text = data.get("plain")
-            if text in (None, ""):
-                return None
-            return {"type": "text", "data": {"text": str(text)}}
-
-        resend_kind = {
-            "plain": "text",
-            "audio": "record",
-            "voice": "record",
-        }.get(kind, kind)
-        if not resend_kind:
+        serializer = getattr(component, "toDict", None)
+        if not callable(serializer):
             return None
-        sanitized = cls._sanitize_value(data)
-        if not isinstance(sanitized, dict):
-            sanitized = {"value": sanitized}
-        if kind in cls._RESEND_MEDIA_KINDS:
-            sanitized = cls._normalize_resend_media_data(sanitized)
-        return {"type": resend_kind, "data": sanitized}
-
-    @classmethod
-    def _normalize_resend_media_data(
-        cls,
-        data: dict[str, Any],
-    ) -> dict[str, Any]:
-        normalized = dict(data)
-        fallback_source = ""
-        preferred_source = ""
-
-        for key in cls._RESEND_MEDIA_SOURCE_KEYS:
-            value = normalized.get(key)
-            if not isinstance(value, str) or not value.strip():
-                continue
-            source = cls._normalize_resend_media_source(value)
-            normalized[key] = source
-            if not fallback_source:
-                fallback_source = source
-            if cls._URI_SCHEME_PATTERN.match(source):
-                preferred_source = source
-                break
-
-        source = preferred_source or fallback_source
-        if source:
-            # OneBot file-like segments consume `file`; NapCat may ignore `url`.
-            normalized["file"] = source
-        return normalized
-
-    @classmethod
-    def _normalize_resend_media_source(cls, value: str) -> str:
-        source = value.strip()
-        if cls._WINDOWS_ABSOLUTE_PATH_PATTERN.match(source):
-            path = source.replace("\\", "/")
-            return f"file:///{quote(path, safe='/:')}"
-        if source.startswith("\\\\"):
-            path = source.replace("\\", "/").lstrip("/")
-            return f"file://{quote(path, safe='/:')}"
-        if source.startswith("/"):
-            return f"file://{quote(source, safe='/:%')}"
-        if source.lower().startswith("file:"):
-            parts = urlsplit(source)
-            encoded_path = quote(parts.path, safe="/:%")
-            return urlunsplit(
-                (parts.scheme, parts.netloc, encoded_path, parts.query, parts.fragment)
-            )
-        return source
+        try:
+            serialized = serializer()
+        except Exception:
+            return None
+        return copy.deepcopy(serialized) if isinstance(serialized, dict) else None
 
     @staticmethod
     def _hash(value: str) -> str:

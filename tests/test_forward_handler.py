@@ -175,6 +175,39 @@ class MergedForwardHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sent[0][0]), 1)
         self.assertEqual(sent[0][1], self.handler.SEND_BATCH_SIZE)
 
+    async def test_enhanced_nested_partial_keeps_historical_leaf_once(self):
+        self.enable(enhanced=True)
+
+        def nested(values):
+            inner_nodes = [
+                {
+                    "type": "node",
+                    "data": {
+                        "user_id": index,
+                        "nickname": f"成员{index}",
+                        "content": [{"type": "text", "data": {"text": value}}],
+                    },
+                }
+                for index, value in enumerate(values, 1)
+            ]
+            return self.inline_forward(
+                [
+                    {
+                        "type": "node",
+                        "data": {"content": self.inline_forward(inner_nodes)},
+                    }
+                ]
+            )
+
+        await self.handler.handle(FakeEvent(nested(["shared"])))
+        await self.handler.handle(FakeEvent(nested(["shared", "new", "new"])))
+
+        sent_nodes = RecordingGateway.instances[1].sent[0][0]
+        self.assertEqual(
+            [node.content[0]["data"]["text"] for node in sent_nodes],
+            ["shared", "new"],
+        )
+
     async def test_enhanced_single_layer_partial_media_is_not_flattened(self):
         self.enable(enhanced=True)
         video_nodes = [

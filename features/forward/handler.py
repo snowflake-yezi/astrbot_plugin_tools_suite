@@ -209,10 +209,7 @@ class MergedForwardHandler:
         if expanded.max_forward_depth <= 1:
             return
 
-        nodes = dedupe_flattened_nodes(
-            expanded.nodes,
-            decision.duplicate_leaf_hashes,
-        )
+        nodes = dedupe_flattened_nodes(expanded.nodes)
         error = await gateway.send_flattened(nodes, batch_size=self.SEND_BATCH_SIZE)
         if error:
             self._warn(f"[tool_suite] enhanced forward send did not complete: {error}")

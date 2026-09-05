@@ -35,7 +35,6 @@ class FakeEvent:
 def flattened_node(value):
     return FlattenedForwardNode(
         content_hash=f"hash-{value}",
-        component_hashes=(f"component-{value}",),
         content=({"type": "text", "data": {"text": value}},),
         sender_id="1",
         sender_name="成员",

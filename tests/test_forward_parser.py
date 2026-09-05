@@ -84,6 +84,8 @@ class ForwardRecordLimitTests(unittest.IsolatedAsyncioTestCase):
                 "data": {
                     "file": "2c4c5ee7405d4c16bfd3ebac5ceb0503.mp4",
                     "url": "/app/.config/QQ/nt_data/Video/Ori/video-a.mp4",
+                    "seq": 17,
+                    "vendor": {"timestamp": 123, "token": "keep"},
                 },
             },
             {
@@ -118,6 +120,16 @@ class ForwardRecordLimitTests(unittest.IsolatedAsyncioTestCase):
                 for item in result.nodes
             ],
             [["video"], ["video"], ["image"]],
+        )
+        self.assertEqual(
+            [item.content[0] for item in result.nodes],
+            components,
+        )
+        self.assertIsNot(result.nodes[0].content[0], components[0])
+        components[0]["data"]["file"] = "changed.mp4"
+        self.assertEqual(
+            result.nodes[0].content[0]["data"]["file"],
+            "2c4c5ee7405d4c16bfd3ebac5ceb0503.mp4",
         )
 
     async def test_forward_depth_accepts_sixteen_layers(self):

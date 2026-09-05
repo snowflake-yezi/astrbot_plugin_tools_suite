@@ -158,11 +158,10 @@ class ForwardDedupTests(unittest.TestCase):
         self.assertTrue(data["scopes"]["group:1"]["forward_enabled"])
         self.assertEqual(data["scopes"]["group:2"]["users"], {"1": ["昵称"]})
 
-    def test_flattened_node_deduplication_uses_history_and_current_order(self):
+    def test_flattened_node_deduplication_only_removes_current_duplicates(self):
         def node(content_hash, content=True):
             return FlattenedForwardNode(
                 content_hash=content_hash,
-                component_hashes=(),
                 content=({"type": "text", "data": {"text": content_hash}},)
                 if content
                 else (),
@@ -172,11 +171,10 @@ class ForwardDedupTests(unittest.TestCase):
             )
 
         result = dedupe_flattened_nodes(
-            (node("historical"), node("new"), node("new"), node("empty", False)),
-            frozenset({"historical"}),
+            (node("historical"), node("new"), node("new"), node("empty", False))
         )
 
-        self.assertEqual([item.content_hash for item in result], ["new"])
+        self.assertEqual([item.content_hash for item in result], ["historical", "new"])
 
 
 if __name__ == "__main__":
