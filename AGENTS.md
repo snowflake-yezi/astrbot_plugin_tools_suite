@@ -2,71 +2,53 @@
 
 ## OVERVIEW
 
-This repository is one AstrBot plugin with three independently owned capabilities: gold prices, group nickname mentions, and QQ/NapCat merged-forward processing. It targets Python 3.12 and AstrBot `>=4.9.2,<5`; `metadata.yaml` declares the `aiocqhttp` platform.
+One AstrBot plugin owns three independent capabilities: gold prices, group nickname mentions, and QQ/NapCat merged-forward processing. It targets Python 3.12 and AstrBot `>=4.9.2,<5`; `metadata.yaml` declares the `aiocqhttp` platform.
 
-The package has no standalone service. AstrBot imports `ToolSuitePlugin` through `__init__.py`. Keep all decorated entry methods physically on that `Star` subclass in `main.py`: AstrBot discovers metadata globally, then binds handlers by the decorated function's exact module path.
-
-## STRUCTURE
-
-| Path | Ownership |
-| --- | --- |
-| `main.py` | AstrBot composition root, 21 decorated adapters, and cross-feature suite commands. |
-| `core/config.py` | Stable plugin names and package/legacy paths. |
-| `core/models.py` | Typed persisted-state and gold-market shapes. |
-| `core/event.py` | Canonical group, scope, text, and mention extraction from AstrBot events. |
-| `core/state.py` | Atomic JSON persistence and one-time legacy-state migration to AstrBot plugin data. |
-| `features/gold/sources.py` | Ordered HTTP providers, payload conversion, FX cache, and trend retrieval. |
-| `features/gold/service.py` | Quote cache, presentation formatting, and quote/trend use cases. |
-| `features/gold/chart.py` | Non-interactive Matplotlib renderer and AstrBot temporary output path. |
-| `features/gold/handler.py` | Gold enable/query event decisions and AstrBot results. |
-| `features/nickname/domain.py` | Nickname parsing, longest-match lookup, collections, and binding decisions. |
-| `features/nickname/handler.py` | Nickname state orchestration and official `At`/`Plain` result chains. |
-| `features/forward/parser.py` | Recursive AstrBot/OneBot parsing, canonical fingerprints, media normalization, and limits. |
-| `features/forward/dedup.py` | History migration/pruning, duplicate decisions, leaf filtering, and the global budget. |
-| `features/forward/gateway.py` | NapCat/OneBot fetch, resend batching, action checks, and recall fallback. |
-| `features/forward/handler.py` | Forward switches, retention, locking, reply policy, resend, and recall orchestration. |
-| `tests/` | Pure unit tests plus real AstrBot component, registration, rendering, and OneBot contract checks. |
-
-Maintained assets are `news.jpg`, `assets/NotoSansSC-GoldChart.ttf`, and `assets/NotoSansSC-OFL.txt`.
+There is no standalone service. AstrBot imports `ToolSuitePlugin` through `__init__.py`. Decorated async-generator entry methods must stay physically on that `Star` subclass in `main.py`: AstrBot binds handlers by the decorated function's exact module path.
 
 ## WHERE TO LOOK
 
-| Task | Primary location | Invariant |
+| Task | Location | Ownership / invariant |
 | --- | --- | --- |
-| Add or rename a chat entry | `main.py` | The decorated async-generator method stays on `ToolSuitePlugin` and delegates to a feature handler. |
-| Change state shape or storage | `core/models.py`, `core/state.py` | Preserve `data/plugin_data/tool_suite/tool_suite.json` and successful-write-before-legacy-delete migration. |
-| Change scope/event interpretation | `core/event.py` | Group keys are `group:<id>`; private keys are `private:<sender_id>`. |
-| Change gold source behavior | `features/gold/sources.py` | Keep provider fallback ordered and network I/O asynchronous. |
-| Change gold output | `features/gold/service.py`, `features/gold/chart.py` | Preserve the 90-second cache and `Agg` renderer. |
-| Change nickname rules | `features/nickname/domain.py` | One user may have many nicknames, one nickname many users, and longest names match first. |
-| Change forward identity | `features/forward/parser.py` | Preserve leaf order and duplicate occurrences; do not make grouping or timestamps part of identity. |
-| Change duplicate history | `features/forward/dedup.py` | Partial matches use whole-leaf hashes; the 16 MiB budget spans every scope. |
-| Change NapCat actions | `features/forward/gateway.py` | Retain `message_id` then `id` fetch compatibility and direct then legacy-API recall fallback. |
-| Change enhanced policy | `features/forward/handler.py` | Enhanced mode stays silent; incomplete expansion never enters history. |
-| Change public behavior/version | `README.md`, `metadata.yaml` | Keep commands, limits, platform, and AstrBot requirements aligned. |
+| Chat entries and suite commands | `main.py` | Composition root; delegate feature behavior to handlers. |
+| Plugin names and resource paths | `core/config.py`, `assets/` | `PACKAGE_ROOT` anchors bundled resources independently of the working directory. |
+| State shape and persistence | `core/models.py`, `core/state.py` | `PluginStateStore` owns atomic writes and successful-write-before-legacy-delete migration. |
+| Event interpretation | `core/event.py` | Canonical text/mention extraction; scopes are `group:<id>` or `private:<sender_id>`. |
+| Gold providers | `features/gold/sources.py` | Ordered asynchronous fallback, FX cache, trend normalization and fresh/stale caches. |
+| Gold output | `features/gold/service.py`, `features/gold/chart.py` | 90-second quote cache, formatting, 15-day trend use case, Matplotlib `Agg` rendering. |
+| Gold event decisions | `features/gold/handler.py` | Enable/query policy and AstrBot results. |
+| Nickname rules | `features/nickname/domain.py` | Many names per user, many users per name, longest-name matching first. |
+| Nickname orchestration | `features/nickname/handler.py` | Scope state, binding/query flow, official `At` and `Plain` chains. |
+| Forward parsing and identity | `features/forward/parser.py` | Recursive AstrBot/OneBot expansion, canonical fingerprints, original resend components and limits. |
+| Forward history | `features/forward/dedup.py` | Migration, pruning, classification, current-record leaf deduplication and global history budget. |
+| NapCat actions | `features/forward/gateway.py` | Fetch, batched resend, action checks and recall fallbacks. |
+| Forward event policy | `features/forward/handler.py` | Switches, retention, locking, replies and enhanced-mode orchestration. |
+| Regression and framework contracts | `tests/` | Domain tests, real AstrBot registration/components, rendering and fake OneBot actions. |
+| Public behavior and requirements | `README.md`, `metadata.yaml` | Keep commands, limits, platform and AstrBot requirements aligned. |
 
 ## CONVENTIONS
 
-- Reuse the canonical owners above; do not recreate event parsing, persistence, provider fallback, or OneBot calls in `main.py`.
-- Keep feature-domain decisions independent from AstrBot where practical. Build `At`, `Plain`, `Reply`, and `Image` only in handlers/adapters.
-- Use concise Simplified Chinese comments only for non-obvious protocol, persistence, or concurrency constraints.
-- Persist state through `PluginStateStore`; writes use a temporary sibling followed by atomic replacement.
-- Treat `FINGERPRINT_VERSION` as a stored-data contract. Update migration behavior and README whenever fingerprint semantics change.
-- Keep forward limits at 16 real forward layers, 256 structural levels, 5000 leaves, and 10000 components unless requirements deliberately change.
-- Do not download media for fingerprinting. Resend-location normalization and fingerprint normalization are separate concerns.
-- Use official AstrBot result/message components first. Direct `call_action` belongs only at the NapCat/OneBot capability boundary.
-- Do not add compatibility modules at removed root paths; internal modules are feature-owned and cleanly relocated.
+- Keep domain decisions independent from AstrBot where practical. Build message components in handlers/adapters; direct `call_action` belongs at the OneBot gateway boundary.
+- Reuse the owners above rather than rebuilding event parsing, persistence, providers or protocol actions in `main.py`. Do not add compatibility modules at removed root paths.
+- Write concise Simplified Chinese comments only for non-obvious protocol, persistence or concurrency constraints. Ruff settings in `pyproject.toml` define formatting and lint rules.
+- Persist through `PluginStateStore`; writes use a temporary sibling followed by atomic replacement. Feature handlers use the store's save operation; forward saves also enforce the history budget.
+- Whole-record forward identity preserves flattened component order and duplicate occurrences, ignoring node grouping, sender and timestamps. Current-version partial matching uses whole-leaf hashes, not isolated shared components.
+- Treat `FINGERPRINT_VERSION` as a persisted contract. Version 3 retains version-2 matching compatibility; unsupported versions clear only forward history. Update migration behavior and README when fingerprint semantics change.
+- Preserve independent expansion limits: 16 real forward layers, 256 structural levels, 5000 leaves and 10000 components. Incomplete expansion never enters history; the 16 MiB history budget spans all scopes.
+- Fingerprint normalization must not rewrite resend content or download media. Preserve original OneBot component fields; serialize AstrBot components with official `toDict()`.
+- Enhanced mode stays silent. Exact duplicates trigger recall regardless of depth. Latest/partial records are resent only when nested beyond the outer layer; remove only duplicate leaves within the current record, retaining historical matches.
+- Keep `get_forward_msg` parameter fallback from `message_id` to `id`, and recall fallback from `bot.call_action` to the legacy API object.
 
 ## COMMANDS
 
-Create the required project-local environment and install development dependencies:
+Run from the repository root. Create the project-local environment if absent, then install the full development dependencies:
 
 ```bash
 uv venv .venv --python 3.12
 uv pip install --python .venv -r requirements-dev.txt
 ```
 
-Run the complete Windows verification suite:
+Windows validation:
 
 ```bash
 .venv/Scripts/python.exe -m pytest -q
@@ -74,16 +56,11 @@ Run the complete Windows verification suite:
 .venv/Scripts/ruff.exe format --check .
 ```
 
-On macOS/Linux use `.venv/bin/` instead. A dependency-light fallback is:
-
-```bash
-python -m unittest discover -s tests -v
-python -c "import ast, pathlib; files=[p for p in pathlib.Path('.').rglob('*.py') if '.venv' not in p.parts]; [ast.parse(p.read_text(encoding='utf-8'), filename=str(p)) for p in files]; print(f'AST parse OK: {len(files)} files')"
-```
+On macOS/Linux use `.venv/bin/` instead. Async tests use `unittest.IsolatedAsyncioTestCase`; no `pytest-asyncio` plugin is required. Full test discovery requires the development dependencies: some test modules import runtime dependencies before any skip guard.
 
 ## NOTES
 
-- Tests isolate AstrBot runtime writes under `.venv/astrbot-test-runtime`; do not let imports create repository `data/` fixtures.
-- Automated tests use AstrBot's real registry/components and fake protocol actions. They do not prove a live QQ account's permissions, cache-file availability, or third-party gold endpoint availability.
-- Group recall requires sufficient QQ role permissions. NapCat may still reject a structurally valid resend when its local media cache has expired.
-- Runtime state lives under the hosting AstrBot instance's `data/plugin_data/tool_suite/`; generated charts live under `data/temp/tool_suite/`.
+- Bundled resources are `assets/duplicate_forward.jpg`, `assets/NotoSansSC-GoldChart.ttf` and `assets/NotoSansSC-OFL.txt`. Keep the font license with the font.
+- Runtime state belongs to the hosting AstrBot instance under `data/plugin_data/tool_suite/`; charts belong under `data/temp/tool_suite/`. The plugin-local `data/tool_suite.json` is only a migration source.
+- Import `tests/astrbot_test_env.py` before AstrBot in tests that load the framework. It defaults `ASTRBOT_ROOT` to `.venv/astrbot-test-runtime`; integration subprocesses use temporary roots. Do not let test imports generate repository-root runtime data.
+- Automated tests do not contact live QQ or gold providers. They cannot prove QQ recall permissions, NapCat media-cache availability or current third-party endpoint behavior; those require target-instance checks.

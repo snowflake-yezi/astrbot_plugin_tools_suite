@@ -126,7 +126,6 @@ class MergedForwardHandlerTests(unittest.IsolatedAsyncioTestCase):
             clock=lambda: 1000,
             warn=lambda _: None,
             gateway_factory=RecordingGateway,
-            image_path=Path(__file__).resolve().parents[1] / "news.jpg",
         )
         messages = self.inline_forward(
             [{"type": "text", "data": {"text": "same image"}}]

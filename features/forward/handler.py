@@ -42,7 +42,7 @@ class MergedForwardHandler:
         clock: Callable[[], float] = time.time,
         warn: Callable[[str], None] = logger.warning,
         gateway_factory: Callable[..., Any] = OneBotForwardGateway,
-        image_path: Path = PACKAGE_ROOT / "news.jpg",
+        image_path: Path = PACKAGE_ROOT / "assets" / "duplicate_forward.jpg",
     ) -> None:
         self._state = state
         self._clock = clock
