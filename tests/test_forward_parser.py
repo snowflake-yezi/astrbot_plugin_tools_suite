@@ -1,3 +1,5 @@
+import hashlib
+import json
 import unittest
 
 from package_loader import load_module
@@ -71,7 +73,7 @@ class ForwardRecordLimitTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result.complete, not extra_leaf)
                 self.assertEqual(result.leaf_count, 2)
-                self.assertEqual(len(result.nodes), 2)
+                self.assertEqual(len(result.leaf_hashes), 2)
                 if extra_leaf:
                     self.assertIn("max-leaf-messages-exceeded", result.errors)
 
@@ -93,7 +95,7 @@ class ForwardRecordLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.complete)
         self.assertIn("max-components-exceeded", result.errors)
 
-    async def test_single_layer_napcat_media_keeps_two_videos_and_image(self):
+    async def test_single_layer_napcat_media_fingerprints_two_videos_and_image(self):
         components = [
             {
                 "type": "video",
@@ -130,23 +132,138 @@ class ForwardRecordLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.complete)
         self.assertEqual(result.max_forward_depth, 1)
         self.assertEqual(result.leaf_count, 3)
+        expected = [
+            "video:digest:2c4c5ee7405d4c16bfd3ebac5ceb0503",
+            "video:digest:df796194d123ebd72ad1eb61bd84f1f5",
+            "image:location:image.jpg",
+        ]
+        self.assertEqual(
+            result.content_hashes,
+            tuple(hashlib.sha256(value.encode()).hexdigest() for value in expected),
+        )
+        self.assertEqual(len(result.leaf_hashes), 3)
+        self.assertEqual(components[0]["data"]["seq"], 17)
+
+    async def test_flatten_preserves_original_content_duplicates_and_senders(self):
+        before = text("  原文\n ")
+        blank = text(" \n ")
+        image = {
+            "type": "image",
+            "data": {
+                "file": "cache.jpg",
+                "url": "https://example.test/a?token=keep",
+                "vendor": {"seq": 17},
+            },
+        }
+        inner_content = [text("重复"), image]
+        inner = {
+            "messages": [
+                {
+                    "sender": {"user_id": 2, "nickname": "内层"},
+                    "time": 22,
+                    "message": inner_content,
+                },
+                {
+                    "sender": {"user_id": 2, "nickname": "内层"},
+                    "time": 23,
+                    "message": inner_content,
+                },
+            ]
+        }
+        outer = {
+            "messages": [
+                {
+                    "sender": {"user_id": 1, "nickname": "外层"},
+                    "time": 11,
+                    "message": [
+                        before,
+                        {"type": "forward", "data": {"id": "inner"}},
+                        blank,
+                        text("结尾"),
+                    ],
+                }
+            ]
+        }
+
+        async def fetch(forward_id):
+            return {"outer": outer, "inner": inner}[forward_id]
+
+        result = await ForwardRecordExpander(fetch).expand(
+            [{"type": "forward", "data": {"id": "outer"}}]
+        )
+        self.assertTrue(result.complete)
+        self.assertEqual(result.max_forward_depth, 2)
+        self.assertEqual(
+            [node.content for node in result.nodes],
+            [
+                (before,),
+                tuple(inner_content),
+                tuple(inner_content),
+                (blank, text("结尾")),
+            ],
+        )
         self.assertEqual(
             [
-                [component["type"] for component in item.content]
-                for item in result.nodes
+                (node.sender_id, node.sender_name, node.timestamp)
+                for node in result.nodes
             ],
-            [["video"], ["video"], ["image"]],
+            [
+                ("1", "外层", 11),
+                ("2", "内层", 22),
+                ("2", "内层", 23),
+                ("1", "外层", 11),
+            ],
+        )
+        result.nodes[1].content[1]["data"]["vendor"]["seq"] = 99
+        self.assertEqual(image["data"]["vendor"]["seq"], 17)
+        self.assertEqual(result.nodes[2].content[1]["data"]["vendor"]["seq"], 17)
+
+    async def test_whitespace_only_node_is_retained_for_resend_not_fingerprint(self):
+        result = await ForwardRecordExpander(self.fetch).expand(
+            [node([text("a")]), node([text(" \n ")]), node([text("b")])]
+        )
+        reference = await ForwardRecordExpander(self.fetch).expand(
+            [node([text("a")]), node([text("b")])]
+        )
+        self.assertTrue(result.complete)
+        self.assertEqual(result.leaf_count, 3)
+        self.assertEqual(result.nodes[1].content, (text(" \n "),))
+        self.assertEqual(result.record_hash, reference.record_hash)
+        self.assertEqual(result.leaf_hashes, reference.leaf_hashes)
+
+    async def test_fingerprint_preserves_order_and_duplicates_but_not_grouping(self):
+        grouped = await ForwardRecordExpander(self.fetch).expand(
+            [node([text("a"), text("b")])]
+        )
+        separate = await ForwardRecordExpander(self.fetch).expand(
+            [node([text("a")]), node([text("b")])]
+        )
+        reversed_record = await ForwardRecordExpander(self.fetch).expand(
+            [node([text("b"), text("a")])]
+        )
+        repeated = await ForwardRecordExpander(self.fetch).expand(
+            [node([text("a"), text("b"), text("b")])]
+        )
+        self.assertEqual(grouped.record_hash, separate.record_hash)
+        self.assertNotEqual(grouped.leaf_hashes, separate.leaf_hashes)
+        self.assertNotEqual(grouped.record_hash, reversed_record.record_hash)
+        self.assertNotEqual(grouped.record_hash, repeated.record_hash)
+        canonical = json.dumps(
+            ["text:a", "text:b"], ensure_ascii=False, separators=(",", ":")
         )
         self.assertEqual(
-            [item.content[0] for item in result.nodes],
-            components,
+            grouped.leaf_hashes, (hashlib.sha256(canonical.encode()).hexdigest(),)
         )
-        self.assertIsNot(result.nodes[0].content[0], components[0])
-        components[0]["data"]["file"] = "changed.mp4"
-        self.assertEqual(
-            result.nodes[0].content[0]["data"]["file"],
-            "2c4c5ee7405d4c16bfd3ebac5ceb0503.mp4",
+
+    async def test_forward_cycle_is_incomplete(self):
+        async def fetch(_):
+            return {"messages": [node([{"type": "forward", "data": {"id": "cycle"}}])]}
+
+        result = await ForwardRecordExpander(fetch).expand(
+            [{"type": "forward", "data": {"id": "cycle"}}]
         )
+        self.assertFalse(result.complete)
+        self.assertIn("forward-cycle:cycle", result.errors)
 
     async def test_forward_depth_accepts_sixteen_layers(self):
         result = await ForwardRecordExpander(nested_forward_fetch(16)).expand(

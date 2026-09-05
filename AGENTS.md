@@ -13,16 +13,16 @@ There is no standalone service. AstrBot imports `ToolSuitePlugin` through `__ini
 | Chat entries and suite commands | `main.py` | Composition root; delegate feature behavior to handlers. |
 | Plugin names and resource paths | `core/config.py`, `assets/` | `PACKAGE_ROOT` anchors bundled resources independently of the working directory. |
 | State shape and persistence | `core/models.py`, `core/state.py` | `PluginStateStore` owns atomic writes and successful-write-before-legacy-delete migration. |
-| Event interpretation | `core/event.py` | Canonical text/mention extraction; scopes are `group:<id>` or `private:<sender_id>`. |
+| Event interpretation | `core/event.py` | Canonical text, mention and message-ID extraction; scopes are `group:<id>` or `private:<sender_id>`. |
 | Gold providers | `features/gold/sources.py` | Ordered asynchronous fallback, FX cache, trend normalization and fresh/stale caches. |
 | Gold output | `features/gold/service.py`, `features/gold/chart.py` | 90-second quote cache, formatting, 15-day trend use case, Matplotlib `Agg` rendering. |
 | Gold event decisions | `features/gold/handler.py` | Enable/query policy and AstrBot results. |
 | Nickname rules | `features/nickname/domain.py` | Many names per user, many users per name, longest-name matching first. |
 | Nickname orchestration | `features/nickname/handler.py` | Scope state, binding/query flow, official `At` and `Plain` chains. |
-| Forward parsing and identity | `features/forward/parser.py` | Recursive AstrBot/OneBot expansion, canonical fingerprints, original resend components and limits. |
-| Forward history | `features/forward/dedup.py` | Migration, pruning, classification, current-record leaf deduplication and global history budget. |
-| NapCat actions | `features/forward/gateway.py` | Fetch, batched resend, action checks and recall fallbacks. |
-| Forward event policy | `features/forward/handler.py` | Switches, retention, locking, replies and enhanced-mode orchestration. |
+| Forward parsing and identity | `features/forward/parser.py` | Recursive expansion, original-content flattened nodes, separate fingerprints and limits. |
+| Forward history | `features/forward/dedup.py` | Migration, pruning, classification, most recent historical match and global history budget. |
+| NapCat actions | `features/forward/gateway.py` | Fetch, ordered resend batches, action checks and recall fallbacks. |
+| Forward event policy | `features/forward/handler.py` | Enable/enhanced switches, retention, locking, flattening, historical replies, mentions, recall and image-to-text fallback. |
 | Regression and framework contracts | `tests/` | Domain tests, real AstrBot registration/components, rendering and fake OneBot actions. |
 | Public behavior and requirements | `README.md`, `metadata.yaml` | Keep commands, limits, platform and AstrBot requirements aligned. |
 
@@ -35,8 +35,10 @@ There is no standalone service. AstrBot imports `ToolSuitePlugin` through `__ini
 - Whole-record forward identity preserves flattened component order and duplicate occurrences, ignoring node grouping, sender and timestamps. Current-version partial matching uses whole-leaf hashes, not isolated shared components.
 - Treat `FINGERPRINT_VERSION` as a persisted contract. Version 3 retains version-2 matching compatibility; unsupported versions clear only forward history. Update migration behavior and README when fingerprint semantics change.
 - Preserve independent expansion limits: 16 real forward layers, 256 structural levels, 5000 leaves and 10000 components. Incomplete expansion never enters history; the 16 MiB history budget spans all scopes.
-- Fingerprint normalization must not rewrite resend content or download media. Preserve original OneBot component fields; serialize AstrBot components with official `toDict()`.
-- Enhanced mode stays silent. Exact duplicates trigger recall regardless of depth. Latest/partial records are resent only when nested beyond the outer layer; remove only duplicate leaves within the current record, retaining historical matches.
+- Do not download media for fingerprinting. Fingerprint normalization must never alter resend content. Failed/incomplete recognition stays silent and does not resend.
+- Enhanced mode controls only nested-forward flattening for new and partial matches: retain original content, order, available sender/time metadata and duplicate occurrences. Send at most 100 outer nodes per batch; do not re-nest, summarize or filter duplicates. New content gets no notice text; duplicate reminders and exact recall remain independent of enhanced mode.
+- Partial matches quote the most recently stored matching original and mention the current sender. Exact matches attempt recall and still remind on recall failure; image construction/send failures fall back to text.
+- History preserves the original message ID, insertion time and leaf fingerprints together. Do not overwrite them from a regrouped duplicate that may be recalled; `tests/test_forward_dedup.py` covers this invariant. Missing legacy IDs mean omitting the reply component, never quoting the current duplicate instead.
 - Keep `get_forward_msg` parameter fallback from `message_id` to `id`, and recall fallback from `bot.call_action` to the legacy API object.
 
 ## COMMANDS
@@ -63,4 +65,4 @@ On macOS/Linux use `.venv/bin/` instead. Async tests use `unittest.IsolatedAsync
 - Bundled resources are `assets/duplicate_forward.jpg`, `assets/NotoSansSC-GoldChart.ttf` and `assets/NotoSansSC-OFL.txt`. Keep the font license with the font.
 - Runtime state belongs to the hosting AstrBot instance under `data/plugin_data/tool_suite/`; charts belong under `data/temp/tool_suite/`. The plugin-local `data/tool_suite.json` is only a migration source.
 - Import `tests/astrbot_test_env.py` before AstrBot in tests that load the framework. It defaults `ASTRBOT_ROOT` to `.venv/astrbot-test-runtime`; integration subprocesses use temporary roots. Do not let test imports generate repository-root runtime data.
-- Automated tests do not contact live QQ or gold providers. They cannot prove QQ recall permissions, NapCat media-cache availability or current third-party endpoint behavior; those require target-instance checks.
+- Automated tests do not contact live QQ or gold providers. They cannot prove QQ recall permissions, historical reply availability, resend media-cache validity or current third-party endpoint behavior; those require target-instance checks.

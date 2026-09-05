@@ -5,19 +5,18 @@ import re
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 from astrbot.api import logger
-from astrbot.api.message_components import Image, Plain, Reply
+from astrbot.api.message_components import At, Image, Plain, Reply
 
 from ...core.config import PACKAGE_ROOT
-from ...core.event import group_id, message_text, scope_key
+from ...core.event import group_id, message_id, message_text, scope_key
 from ...core.models import PluginData, ScopeData
 from ...core.state import PluginStateStore
 from .dedup import (
     ForwardStatus,
     classify_and_store_forward,
-    dedupe_flattened_nodes,
     enforce_forward_history_budget,
     prune_forward_records,
 )
@@ -29,11 +28,8 @@ class MergedForwardHandler:
     DEFAULT_DEDUP_DAYS = 2
     MAX_DEDUP_DAYS = 365
     SEND_BATCH_SIZE = 100
-    REPLY_TEXT: ClassVar[dict[ForwardStatus, str]] = {
-        ForwardStatus.LATEST: "咪~让我看看，你又发出来什么好东西",
-        ForwardStatus.PARTIAL: "咦，好熟悉的感觉，里面有部分内容已经有人发过一次啦",
-        ForwardStatus.EXACT: "该条news已经发送过啦",
-    }
+    PARTIAL_TEXT = "咦，好熟悉的感觉，里面有部分内容已经有人发过一次啦"
+    EXACT_TEXT = "咦，这份聊天记录已经有人发过啦，期待你下次带来新鲜的好东西~"
 
     def __init__(
         self,
@@ -80,9 +76,9 @@ class MergedForwardHandler:
         scope["forward_enhanced_enabled"] = enabled
         self._save(data)
         text = (
-            "聊天记录增强已开启：基础查重已同步开启，将平铺重发新内容并撤回完全重复记录。"
+            "聊天记录增强已开启：将平铺重发嵌套记录，查重提醒与重复撤回保持启用。"
             if enabled
-            else "聊天记录增强已关闭，基础展开与查重不受影响。"
+            else "聊天记录增强已关闭，查重提醒与重复撤回不受影响。"
         )
         return event.plain_result(text)
 
@@ -121,7 +117,7 @@ class MergedForwardHandler:
             "\n".join(
                 [
                     f"聊天记录展开与查重：{enabled}",
-                    f"聊天记录增强：{enhanced}",
+                    f"聊天记录增强（平铺重发）：{enhanced}",
                     f"查重范围：最近 {self.retention_days(scope)} 天",
                     f"范围内聊天记录：{len(records)} 份",
                 ]
@@ -146,99 +142,79 @@ class MergedForwardHandler:
         scope = self._state.scope(data, scope_key(event))
         if not scope.get("forward_enabled", False):
             return None
-        enhanced = bool(scope.get("forward_enhanced_enabled", False))
 
         should_call_llm = getattr(event, "should_call_llm", None)
         if callable(should_call_llm):
             should_call_llm(False)
 
         gateway = self._gateway_factory(
-            event,
-            group_id=group_id(event),
-            warn=self._warn,
+            event, group_id=group_id(event), warn=self._warn
         )
-        expanded = await ForwardRecordExpander(gateway.fetch).expand(candidates)
+        try:
+            expanded = await ForwardRecordExpander(gateway.fetch).expand(candidates)
+        except Exception as exc:
+            self._warn(f"[tool_suite] forward record recognition failed: {exc}")
+            return None
         if not expanded.complete or not expanded.record_hash:
             self._warn(
                 "[tool_suite] forward record expansion incomplete: "
                 f"leaf_count={expanded.leaf_count}, errors={expanded.errors}"
             )
-            if enhanced:
-                return None
-            return self._reply_result(event, "聊天记录展开失败，未执行查重。")
+            return None
 
         async with self._lock:
             data = self._state.load()
             scope = self._state.scope(data, scope_key(event))
             if not scope.get("forward_enabled", False):
                 return None
-            status = classify_and_store_forward(
+            match = classify_and_store_forward(
                 scope,
                 record_hash=expanded.record_hash,
                 content_hashes=expanded.content_hashes,
-                leaf_hashes=tuple(node.content_hash for node in expanded.nodes),
+                leaf_hashes=expanded.leaf_hashes,
+                message_id=str(message_id(event) or ""),
                 compatible_record_hashes=(expanded.legacy_record_hash,),
-                compatible_content_hashes=expanded.legacy_content_hashes,
+                compatible_content_hashes=expanded.leaf_hashes,
                 now=int(self._clock()),
                 retention_days=self.retention_days(scope),
             )
             enhanced = bool(scope.get("forward_enhanced_enabled", False))
             self._save(data)
 
-        if enhanced:
-            await self._handle_enhanced(gateway, expanded, status)
-            return None
-        if status == ForwardStatus.EXACT:
-            image_result = self._image_reply_result(event)
-            if image_result is not None:
-                return image_result
-        return self._reply_result(event, self.REPLY_TEXT[status])
+        if (
+            enhanced
+            and match.status != ForwardStatus.EXACT
+            and expanded.max_forward_depth > 1
+        ):
+            error = await gateway.send_flattened(
+                expanded.nodes, batch_size=self.SEND_BATCH_SIZE
+            )
+            if error:
+                self._warn(f"[tool_suite] flattened forward send failed: {error}")
 
-    async def _handle_enhanced(
-        self, gateway: Any, expanded: Any, status: ForwardStatus
-    ) -> None:
-        if status == ForwardStatus.EXACT:
+        if match.status == ForwardStatus.LATEST:
+            return None
+        if match.status == ForwardStatus.EXACT:
             error = await gateway.recall_original()
             if error:
-                self._warn(
-                    f"[tool_suite] enhanced forward recall did not complete: {error}"
-                )
-            return
-        if expanded.max_forward_depth <= 1:
-            return
+                self._warn(f"[tool_suite] duplicate forward recall failed: {error}")
 
-        nodes = dedupe_flattened_nodes(expanded.nodes)
-        error = await gateway.send_flattened(nodes, batch_size=self.SEND_BATCH_SIZE)
-        if error:
-            self._warn(f"[tool_suite] enhanced forward send did not complete: {error}")
-
-    def _image_reply_result(self, event: Any) -> Any | None:
-        if not self._image_path.is_file():
-            self._warn(
-                f"[tool_suite] exact duplicate image missing: {self._image_path}"
-            )
-            return None
-        try:
-            image = Image.fromFileSystem(str(self._image_path))
-        except Exception as exc:
-            self._warn(
-                "[tool_suite] unable to build exact duplicate image component: "
-                f"path={self._image_path}, error={exc}"
-            )
-            return None
         chain: list[Any] = []
-        message_id = str(getattr(event.message_obj, "message_id", "") or "").strip()
-        if message_id:
-            chain.append(Reply(id=message_id))
-        chain.append(image)
-        return event.chain_result(chain)
+        if match.message_id:
+            chain.append(Reply(id=match.message_id))
+        chain.append(At(qq=str(event.get_sender_id())))
+        if match.status == ForwardStatus.PARTIAL:
+            return event.chain_result([*chain, Plain(" " + self.PARTIAL_TEXT)])
 
-    @staticmethod
-    def _reply_result(event: Any, text: str) -> Any:
-        message_id = str(getattr(event.message_obj, "message_id", "") or "").strip()
-        if message_id:
-            return event.chain_result([Reply(id=message_id), Plain(text)])
-        return event.plain_result(text)
+        if self._image_path.is_file():
+            try:
+                image = Image.fromFileSystem(str(self._image_path))
+                # 在此发送才能捕获文件读取或平台发送失败，并回退为文字提醒。
+                await event.send(event.chain_result([*chain, image]))
+                return None
+            except Exception as exc:
+                self._warn(f"[tool_suite] duplicate forward image failed: {exc}")
+        return event.chain_result([*chain, Plain(" " + self.EXACT_TEXT)])
 
     def _save(self, data: PluginData) -> None:
         enforce_forward_history_budget(data)

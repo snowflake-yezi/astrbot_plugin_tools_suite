@@ -10,7 +10,7 @@ from package_loader import load_module
 
 try:
     from astrbot.api.event import MessageChain
-    from astrbot.api.message_components import Node, Nodes, Plain
+    from astrbot.api.message_components import At, Image, Plain, Reply
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
         AiocqhttpMessageEvent,
     )
@@ -50,8 +50,11 @@ class RecordingBot:
     def __init__(self):
         self.actions = []
 
-    async def call_action(self, action, **payload):
-        self.actions.append((action, payload))
+    async def send_group_msg(self, **payload):
+        self.actions.append(("send_group_msg", payload))
+
+    async def send_private_msg(self, **payload):
+        self.actions.append(("send_private_msg", payload))
 
 
 @unittest.skipUnless(ASTRBOT_AVAILABLE, "AstrBot development dependency is unavailable")
@@ -106,54 +109,54 @@ print(len(handlers))
             completed.stdout.strip().splitlines()[-1], str(len(EXPECTED_HANDLERS))
         )
 
-    async def test_official_aiocqhttp_serializes_nodes_for_onebot_actions(self):
+    async def test_official_aiocqhttp_serializes_historical_reply_and_mention(self):
         bot = RecordingBot()
-        nodes = Nodes(
-            [
-                Node(
-                    content=[Plain("hello")],
-                    uin="7",
-                    name="Alice",
-                )
-            ]
-        )
+        for is_group, session_id in ((True, "42"), (False, "8")):
+            await AiocqhttpMessageEvent.send_message(
+                bot,
+                MessageChain([Reply(id="100"), At(qq="7"), Plain("重复提醒")]),
+                is_group=is_group,
+                session_id=session_id,
+            )
 
-        await AiocqhttpMessageEvent.send_message(
-            bot,
-            MessageChain([nodes]),
-            is_group=True,
-            session_id="42",
-        )
-        await AiocqhttpMessageEvent.send_message(
-            bot,
-            MessageChain([nodes]),
-            is_group=False,
-            session_id="8",
-        )
-
-        expected_messages = [
-            {
-                "type": "node",
-                "data": {
-                    "user_id": "7",
-                    "nickname": "Alice",
-                    "content": [{"type": "text", "data": {"text": "hello"}}],
-                },
-            }
+        expected = [
+            {"type": "reply", "data": {"id": "100"}},
+            {"type": "at", "data": {"qq": "7"}},
+            {"type": "text", "data": {"text": " "}},
+            {"type": "text", "data": {"text": "重复提醒"}},
         ]
         self.assertEqual(
             bot.actions,
             [
-                (
-                    "send_group_forward_msg",
-                    {"messages": expected_messages, "group_id": "42"},
-                ),
-                (
-                    "send_private_forward_msg",
-                    {"messages": expected_messages, "user_id": "8"},
-                ),
+                ("send_group_msg", {"group_id": 42, "message": expected}),
+                ("send_private_msg", {"user_id": 8, "message": expected}),
             ],
         )
+
+    async def test_duplicate_image_shares_one_message_with_reply_and_mention(self):
+        bot = RecordingBot()
+        await AiocqhttpMessageEvent.send_message(
+            bot,
+            MessageChain(
+                [
+                    Reply(id="100"),
+                    At(qq="7"),
+                    Image.fromFileSystem(
+                        str(PACKAGE_ROOT / "assets" / "duplicate_forward.jpg")
+                    ),
+                ]
+            ),
+            is_group=True,
+            session_id="42",
+        )
+        self.assertEqual(len(bot.actions), 1)
+        messages = bot.actions[0][1]["message"]
+        self.assertEqual(
+            [segment["type"] for segment in messages], ["reply", "at", "text", "image"]
+        )
+        self.assertEqual(messages[0]["data"]["id"], "100")
+        self.assertEqual(messages[1]["data"]["qq"], "7")
+        self.assertTrue(messages[-1]["data"]["file"].startswith("base64://"))
 
     def test_metadata_declares_tested_astrbot_and_platform_contracts(self):
         from importlib.metadata import version

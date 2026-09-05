@@ -26,6 +26,7 @@ class ForwardRecord(TypedDict):
     content_hashes: list[str]
     leaf_hashes: list[str]
     seen_at: int
+    message_id: str
 
 
 class ScopeData(TypedDict, total=False):

@@ -52,3 +52,20 @@ def at_user_ids(event: Any) -> list[str]:
         seen.add(user_id)
         user_ids.append(user_id)
     return user_ids
+
+
+def message_id(event: Any) -> int | str | None:
+    message_obj = getattr(event, "message_obj", None)
+    raw_message = getattr(message_obj, "raw_message", None)
+    value = raw_message.get("message_id") if isinstance(raw_message, dict) else None
+    if value in (None, ""):
+        value = getattr(message_obj, "message_id", None)
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        if value.lstrip("-").isdigit():
+            return int(value)
+    return value

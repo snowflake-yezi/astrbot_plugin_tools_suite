@@ -29,6 +29,19 @@ class PluginStateStoreTests(unittest.TestCase):
         self.assertEqual(second["users"], {})
         self.assertEqual(data["scopes"]["group:1"], first)
 
+    def test_load_preserves_enhanced_switch_and_active_state(self):
+        scope = {
+            "forward_enabled": True,
+            "forward_enhanced_enabled": True,
+            "users": {"1": ["昵称"]},
+        }
+        self.store.save({"scopes": {"group:1": scope}})
+
+        loaded = self.store.load()
+        self.assertEqual(loaded["scopes"]["group:1"], scope)
+        self.store.save(loaded)
+        self.assertEqual(self.store.load(), loaded)
+
     def test_save_replaces_file_without_leaving_temporary_file(self):
         data = {"scopes": {"group:1": {"gold_enabled": True}}}
 

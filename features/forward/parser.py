@@ -14,7 +14,6 @@ ForwardFetcher = Callable[[str], Awaitable[Any]]
 
 @dataclass(frozen=True)
 class FlattenedForwardNode:
-    content_hash: str
     content: tuple[dict[str, Any], ...]
     sender_id: str
     sender_name: str
@@ -33,7 +32,7 @@ class ExpandedForwardRecord:
     record_hash: str
     content_hashes: tuple[str, ...]
     legacy_record_hash: str
-    legacy_content_hashes: tuple[str, ...]
+    leaf_hashes: tuple[str, ...]
     nodes: tuple[FlattenedForwardNode, ...]
     max_forward_depth: int
     leaf_count: int
@@ -138,10 +137,10 @@ class ForwardRecordExpander:
             record_hash=record_hash,
             content_hashes=tuple(self._component_hashes),
             legacy_record_hash=legacy_record_hash,
-            legacy_content_hashes=tuple(self._leaf_hashes),
+            leaf_hashes=tuple(self._leaf_hashes),
             nodes=tuple(self._nodes),
             max_forward_depth=self._max_forward_depth,
-            leaf_count=len(self._leaf_hashes),
+            leaf_count=len(self._nodes),
             complete=self._complete,
             errors=tuple(self._errors),
         )
@@ -150,7 +149,7 @@ class ForwardRecordExpander:
         if depth > self.MAX_STRUCTURE_DEPTH:
             self._mark_incomplete("max-structure-depth-exceeded")
             return
-        if len(self._leaf_hashes) >= self.MAX_LEAF_MESSAGES:
+        if len(self._nodes) >= self.MAX_LEAF_MESSAGES:
             self._mark_incomplete("max-leaf-messages-exceeded")
             return
         if item is None:
@@ -176,9 +175,7 @@ class ForwardRecordExpander:
         if kind == "node":
             content = self._field(item, "content") or self._field(item, "message")
             await self._expand_content(
-                content,
-                depth + 1,
-                metadata=self._node_metadata(item),
+                content, depth + 1, metadata=self._node_metadata(item)
             )
             return
 
@@ -194,9 +191,7 @@ class ForwardRecordExpander:
                     value = data.get(key)
                     if isinstance(value, list):
                         await self._expand_content(
-                            value,
-                            depth + 1,
-                            metadata=self._node_metadata(item),
+                            value, depth + 1, metadata=self._node_metadata(item)
                         )
                         return
 
@@ -208,9 +203,7 @@ class ForwardRecordExpander:
             message = item.get("message")
             if isinstance(message, list):
                 await self._expand_content(
-                    message,
-                    depth + 1,
-                    metadata=self._node_metadata(item),
+                    message, depth + 1, metadata=self._node_metadata(item)
                 )
                 return
 
@@ -222,9 +215,7 @@ class ForwardRecordExpander:
             content = item.get("content")
             if isinstance(content, list):
                 await self._expand_content(
-                    content,
-                    depth + 1,
-                    metadata=self._node_metadata(item),
+                    content, depth + 1, metadata=self._node_metadata(item)
                 )
 
     async def _expand_forward(self, item: Any, depth: int) -> None:
@@ -312,29 +303,26 @@ class ForwardRecordExpander:
         regular_components: list[str] = []
         resend_components: list[dict[str, Any]] = []
 
-        async def flush_regular_components() -> None:
-            if not regular_components:
+        def flush_regular_components() -> None:
+            if not resend_components:
                 return
-            if len(self._leaf_hashes) >= self.MAX_LEAF_MESSAGES:
+            if len(self._nodes) >= self.MAX_LEAF_MESSAGES:
                 self._mark_incomplete("max-leaf-messages-exceeded")
                 regular_components.clear()
                 resend_components.clear()
                 return
-            canonical = json.dumps(
-                regular_components,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            component_hashes = tuple(
-                self._hash(component) for component in regular_components
-            )
-            content_hash = self._hash(canonical)
+            if regular_components:
+                canonical = json.dumps(
+                    regular_components, ensure_ascii=False, separators=(",", ":")
+                )
+                self._component_hashes.extend(
+                    self._hash(component) for component in regular_components
+                )
+                self._leaf_hashes.append(self._hash(canonical))
             node_metadata = metadata or _NodeMetadata()
-            self._component_hashes.extend(component_hashes)
-            self._leaf_hashes.append(content_hash)
+            # 指纹可忽略空白，重发内容仍须保留空白和重复消息。
             self._nodes.append(
                 FlattenedForwardNode(
-                    content_hash=content_hash,
                     content=tuple(resend_components),
                     sender_id=node_metadata.sender_id,
                     sender_name=node_metadata.sender_name,
@@ -346,7 +334,7 @@ class ForwardRecordExpander:
 
         for component in content:
             if component_kind(component) in {"forward", "node", "nodes"}:
-                await flush_regular_components()
+                flush_regular_components()
                 await self._expand_item(component, depth + 1)
                 continue
             if self._component_count >= self.MAX_COMPONENTS:
@@ -361,7 +349,7 @@ class ForwardRecordExpander:
             canonical = self._canonical_component(component)
             if canonical:
                 regular_components.append(canonical)
-        await flush_regular_components()
+        flush_regular_components()
 
     def _mark_incomplete(self, reason: str) -> None:
         self._complete = False

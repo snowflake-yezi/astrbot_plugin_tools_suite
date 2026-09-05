@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from ...core.event import message_id
+
 if TYPE_CHECKING:
     from .parser import FlattenedForwardNode
 
@@ -40,7 +42,7 @@ class OneBotForwardGateway:
 
     @staticmethod
     def _build_nodes(
-        nodes: list[FlattenedForwardNode],
+        nodes: tuple[FlattenedForwardNode, ...],
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for node in nodes:
@@ -53,26 +55,6 @@ class OneBotForwardGateway:
                 data["time"] = node.timestamp
             result.append({"type": "node", "data": data})
         return result
-
-    def _message_id(self) -> int | str | None:
-        message_obj = getattr(self._event, "message_obj", None)
-        raw_message = getattr(message_obj, "raw_message", None)
-        raw_id = (
-            raw_message.get("message_id") if isinstance(raw_message, dict) else None
-        )
-        message_id = raw_id
-        if message_id in (None, ""):
-            message_id = getattr(message_obj, "message_id", None)
-        if message_id in (None, ""):
-            return None
-        if isinstance(message_id, str):
-            normalized = message_id.strip()
-            if not normalized:
-                return None
-            if normalized.lstrip("-").isdigit():
-                return int(normalized)
-            return normalized
-        return message_id
 
     async def fetch(self, forward_id: str) -> Any:
         bot = getattr(self._event, "bot", None)
@@ -101,7 +83,7 @@ class OneBotForwardGateway:
 
     async def send_flattened(
         self,
-        nodes: list[FlattenedForwardNode],
+        nodes: tuple[FlattenedForwardNode, ...],
         *,
         batch_size: int,
     ) -> str | None:
@@ -144,8 +126,8 @@ class OneBotForwardGateway:
         return None
 
     async def recall_original(self) -> str | None:
-        message_id = self._message_id()
-        if message_id is None:
+        original_id = message_id(self._event)
+        if original_id is None:
             return "撤回重复聊天记录失败：当前消息没有可用的消息 ID。"
         bot = getattr(self._event, "bot", None)
         api = getattr(bot, "api", None)
@@ -171,7 +153,7 @@ class OneBotForwardGateway:
             try:
                 result = await call_action(
                     "delete_msg",
-                    message_id=message_id,
+                    message_id=original_id,
                     **extra_params,
                 )
             except Exception as exc:
@@ -183,7 +165,7 @@ class OneBotForwardGateway:
 
         self._warn(
             "[tool_suite] exact duplicate recall failed: "
-            f"message_id={message_id}, attempts={failures}"
+            f"message_id={original_id}, attempts={failures}"
         )
         if self._group_id is not None:
             return (

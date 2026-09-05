@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ...core.models import ForwardRecord, PluginData, ScopeData
-
-if TYPE_CHECKING:
-    from .parser import FlattenedForwardNode
-
 
 FINGERPRINT_VERSION = 3
 MAX_STORED_RECORDS = 10000
@@ -21,18 +18,10 @@ class ForwardStatus(StrEnum):
     EXACT = "exact"
 
 
-def dedupe_flattened_nodes(
-    nodes: tuple[FlattenedForwardNode, ...],
-) -> list[FlattenedForwardNode]:
-    seen: set[str] = set()
-    result: list[FlattenedForwardNode] = []
-    for node in nodes:
-        if node.content_hash in seen:
-            continue
-        seen.add(node.content_hash)
-        if node.content:
-            result.append(node)
-    return result
+@dataclass(frozen=True)
+class ForwardMatch:
+    status: ForwardStatus
+    message_id: str = ""
 
 
 def _hashes(values: Any) -> list[str]:
@@ -132,7 +121,7 @@ def prune_forward_records(
         content_hashes = item.get("content_hashes")
         leaf_hashes = item.get("leaf_hashes")
         if fingerprint_version == 2 and leaf_hashes is None:
-            # v2 没有叶子哈希；空列表会保留其整份/部分兼容判断，但不会误删节点。
+            # v2 仅有组件指纹，仍用于兼容查重。
             leaf_hashes = []
         if (
             seen_at < cutoff
@@ -147,6 +136,7 @@ def prune_forward_records(
                 "content_hashes": _hashes(content_hashes),
                 "leaf_hashes": _hashes(leaf_hashes),
                 "seen_at": seen_at,
+                "message_id": str(item.get("message_id") or "").strip(),
             }
         )
 
@@ -162,67 +152,48 @@ def classify_and_store_forward(
     record_hash: str,
     content_hashes: tuple[str, ...],
     leaf_hashes: tuple[str, ...],
+    message_id: str,
     compatible_record_hashes: tuple[str, ...] = (),
     compatible_content_hashes: tuple[str, ...] = (),
     now: int,
     retention_days: int,
-) -> ForwardStatus:
-    records = prune_forward_records(
-        scope,
-        now=now,
-        retention_days=retention_days,
-    )
-    current_content_sequence = tuple(content_hashes)
+) -> ForwardMatch:
+    records = prune_forward_records(scope, now=now, retention_days=retention_days)
     current_leaf_hashes = set(leaf_hashes)
+    compatible_hashes = set(compatible_content_hashes)
     exact_hashes = {record_hash, *compatible_record_hashes}
     exact_hashes.discard("")
     exact_record: ForwardRecord | None = None
-    previous_leaf_hashes: set[str] = set()
-    previous_v2_content_hashes: set[str] = set()
+    partial_record: ForwardRecord | None = None
 
     for record in records:
-        stored_content_sequence = tuple(record.get("content_hashes") or [])
-        stored_leaf_hashes = set(record.get("leaf_hashes") or [])
-        previous_leaf_hashes.update(stored_leaf_hashes)
-        if not stored_leaf_hashes:
-            previous_v2_content_hashes.update(stored_content_sequence)
-        if exact_record is None and (
-            record.get("record_hash") in exact_hashes
-            or (
-                bool(current_content_sequence)
-                and stored_content_sequence == current_content_sequence
-            )
+        stored_content = tuple(record["content_hashes"])
+        stored_leaves = set(record["leaf_hashes"])
+        if record["record_hash"] in exact_hashes or (
+            bool(content_hashes) and stored_content == content_hashes
         ):
-            exact_record = record
+            if exact_record is None or record["seen_at"] >= exact_record["seen_at"]:
+                exact_record = record
+        elif current_leaf_hashes.intersection(stored_leaves) or (
+            not stored_leaves and compatible_hashes.intersection(stored_content)
+        ):
+            if partial_record is None or record["seen_at"] >= partial_record["seen_at"]:
+                partial_record = record
 
     if exact_record is not None:
-        exact_record.update(
-            record_hash=record_hash,
-            content_hashes=list(content_hashes),
-            leaf_hashes=list(leaf_hashes),
-            seen_at=now,
-        )
-        status = ForwardStatus.EXACT
-    else:
-        has_duplicate_leaf = bool(
-            current_leaf_hashes.intersection(previous_leaf_hashes)
-        )
-        has_v2_duplicate = bool(
-            set(compatible_content_hashes).intersection(previous_v2_content_hashes)
-        )
-        status = (
-            ForwardStatus.PARTIAL
-            if has_duplicate_leaf or has_v2_duplicate
-            else ForwardStatus.LATEST
-        )
-        records.append(
-            {
-                "record_hash": record_hash,
-                "content_hashes": list(content_hashes),
-                "leaf_hashes": list(leaf_hashes),
-                "seen_at": now,
-            }
-        )
+        # 保留原消息的 ID、时间和叶子分组，不能被即将撤回的重复消息覆盖。
+        return ForwardMatch(ForwardStatus.EXACT, exact_record["message_id"])
 
+    records.append(
+        {
+            "record_hash": record_hash,
+            "content_hashes": list(content_hashes),
+            "leaf_hashes": list(leaf_hashes),
+            "message_id": message_id,
+            "seen_at": now,
+        }
+    )
     scope["forward_records"] = records[-MAX_STORED_RECORDS:]
-    return status
+    if partial_record is not None:
+        return ForwardMatch(ForwardStatus.PARTIAL, partial_record["message_id"])
+    return ForwardMatch(ForwardStatus.LATEST)
